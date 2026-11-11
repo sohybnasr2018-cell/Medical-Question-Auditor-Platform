@@ -11,7 +11,8 @@ import {
   Eye,
   CheckCircle2,
   Clock,
-  Loader2
+  Loader2,
+  RefreshCw
 } from 'lucide-react';
 import { Badge } from '@/components/ui/Badge';
 import { Dialog } from '@/components/ui/Dialog';
@@ -32,6 +33,7 @@ export default function ExaminationLibraryPage() {
   const [previewExam, setPreviewExam] = useState<any>(null);
   const [previewQuestions, setPreviewQuestions] = useState<any[]>([]);
   const [loadingQuestions, setLoadingQuestions] = useState(false);
+  const [reprocessingId, setReprocessingId] = useState<string | null>(null);
 
   const fetchExaminations = async () => {
     try {
@@ -119,6 +121,27 @@ export default function ExaminationLibraryPage() {
     }
   };
 
+  const handleReprocessExam = async (examId: string) => {
+    try {
+      setReprocessingId(examId);
+      const res = await fetch('/api/examinations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: examId })
+      });
+      if (res.ok) {
+        fetchExaminations();
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        alert(`Re-extract failed: ${errData.error || 'Server error'}`);
+      }
+    } catch (err) {
+      console.error('Re-extract failed:', err);
+    } finally {
+      setReprocessingId(null);
+    }
+  };
+
   return (
     <div className="max-w-7xl mx-auto space-y-6">
       {/* Header */}
@@ -201,6 +224,17 @@ export default function ExaminationLibraryPage() {
                     {new Date(exam.created_at).toLocaleDateString()}
                   </td>
                   <td className="px-6 py-4 text-right space-x-2">
+                    <button
+                      type="button"
+                      disabled={reprocessingId === exam.id}
+                      onClick={() => handleReprocessExam(exam.id)}
+                      className="inline-flex items-center space-x-1 text-xs font-semibold text-amber-700 hover:bg-amber-100 bg-amber-50 px-2.5 py-1.5 rounded-lg border border-amber-200 disabled:opacity-50"
+                      title="Re-extract questions (with OCR/Vision recovery)"
+                    >
+                      <RefreshCw className={`h-3 w-3 ${reprocessingId === exam.id ? 'animate-spin' : ''}`} />
+                      <span>{reprocessingId === exam.id ? 'Extracting...' : 'Re-extract'}</span>
+                    </button>
+
                     <button
                       type="button"
                       onClick={() => openPreview(exam)}

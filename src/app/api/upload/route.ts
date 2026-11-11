@@ -3,7 +3,8 @@ import { getDb, REFERENCES_DIR, EXAMINATIONS_DIR } from '@/lib/db';
 import { parsePdfDocument } from '@/lib/pdf/parser';
 import { ocrPdfScannedPages } from '@/lib/pdf/ocr';
 import { indexDocumentPages } from '@/lib/search/indexer';
-import { detectMedicalDiscipline, extractExamQuestionsFromText } from '@/lib/pdf/exam-parser';
+import { detectMedicalDiscipline } from '@/lib/pdf/exam-parser';
+import { extractExaminationQuestionsWithVisionFallback } from '@/lib/pdf/exam-pipeline';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -88,6 +89,13 @@ export async function POST(req: NextRequest) {
 
     let totalConfidence = 0;
     let fullDocText = '';
+    const finalPagesForPipeline: Array<{
+      pdfPageIndex: number;
+      text: string;
+      ocrApplied: boolean;
+      ocrConfidence: number;
+      pageType: 'digital' | 'scanned' | 'mixed';
+    }> = [];
 
     const pagesNeedingOcr = parseResult.pages
       .filter(p => p.pageType === 'scanned' || p.wordCount < 15)
@@ -112,6 +120,13 @@ export async function POST(req: NextRequest) {
 
       totalConfidence += ocrConfidence;
       fullDocText += '\n' + finalText;
+      finalPagesForPipeline.push({
+        pdfPageIndex: page.pdfPageIndex,
+        text: finalText,
+        ocrApplied,
+        ocrConfidence,
+        pageType: page.pageType
+      });
 
       insertPage.run(
         pageId,
@@ -161,7 +176,21 @@ export async function POST(req: NextRequest) {
         status: 'ready'
       });
     } else {
-      const parsedQuestions = extractExamQuestionsFromText(fullDocText);
+      const outcome = await extractExaminationQuestionsWithVisionFallback(buffer, finalPagesForPipeline);
+      const parsedQuestions = outcome.questions;
+
+      if (outcome.updatedPageTexts.size > 0) {
+        const updatePageText = db.prepare(`
+          UPDATE document_pages
+          SET extracted_text = ?, ocr_applied = 1, ocr_confidence = 99, word_count = ?, char_count = ?, flagged_uncertain = 0
+          WHERE document_id = ? AND pdf_page_index = ?
+        `);
+        for (const [pageIdx, textVal] of outcome.updatedPageTexts.entries()) {
+          const wc = textVal.split(/\s+/).filter(Boolean).length;
+          updatePageText.run(textVal, wc, textVal.length, docId, pageIdx);
+        }
+      }
+
       const examId = crypto.randomUUID();
 
       const insertExam = db.prepare(`

@@ -1,8 +1,16 @@
 /**
  * Medical Examination Questions Parser
  * Extracts individual stems, choices (a/b/c/d/e or A/B/C/D/E, single- or two-column),
- * written/essay questions, and designated answer keys (inline or from end-of-book answer matrices).
+ * written/essay questions, and designated answer keys (inline, page-footer strips, or end-of-book matrices).
  */
+
+export interface ParsedExamQuestion {
+  questionNumber: number;
+  originalNumber: number;
+  stem: string;
+  options: Array<{ label: string; text: string }>;
+  designatedAnswer: string;
+}
 
 export function detectMedicalDiscipline(text: string): string {
   const t = text.toLowerCase();
@@ -34,6 +42,31 @@ function normalizeSectionKey(name: string): string {
 }
 
 /**
+ * Parse horizontal paired answer strips (e.g. "98 b  99 a  100 d  101 d") commonly placed in page footers.
+ */
+function parseHorizontalAnswerPairs(text: string): Record<number, string> {
+  const map: Record<number, string> = {};
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.length > 220) continue;
+    const pairs = Array.from(line.matchAll(/\b(\d{1,3})\s*[\.\:\-\)]?\s*([a-eA-E])\b(?!\s*[a-zA-Z]{2,})/g));
+    // Require at least 3 key pairs on the same strip so normal prose (e.g. "4 hours") never triggers
+    if (pairs.length >= 3) {
+      const leftover = line.replace(/\b\d{1,3}\s*[\.\:\-\)]?\s*[a-eA-E]\b/g, '').replace(/[\s|,;:\-\[\]\(\)]+/g, '');
+      if (leftover.length <= 6) {
+        for (const p of pairs) {
+          const qNum = parseInt(p[1], 10);
+          if (qNum > 0 && qNum <= 500) {
+            map[qNum] = p[2].toUpperCase();
+          }
+        }
+      }
+    }
+  }
+  return map;
+}
+
+/**
  * Parse end-of-book "Answers / Answer Key" matrix sections (e.g. "1. End Module 2022" -> { 1: 'A', 2: 'C', ... })
  * and return both the key map and the body text with the answer appendix removed.
  */
@@ -41,12 +74,14 @@ function splitAndParseAnswerKeys(rawText: string): {
   bodyText: string;
   sectionAnswers: Map<string, Record<number, string>>;
   orderedSections: Array<{ key: string; answers: Record<number, string> }>;
+  horizontalAnswers: Record<number, string>;
 } {
   const normalized = rawText.replace(/\r\n/g, '\n');
+  const horizontalAnswers = parseHorizontalAnswerPairs(normalized);
   const ansHeadingMatch = normalized.match(/(?:^|\n)\s*(?:Answers?|Answer\s+Keys?)\s*\n/i);
 
   if (!ansHeadingMatch || ansHeadingMatch.index === undefined) {
-    return { bodyText: normalized, sectionAnswers: new Map(), orderedSections: [] };
+    return { bodyText: normalized, sectionAnswers: new Map(), orderedSections: [], horizontalAnswers };
   }
 
   // Only treat as an appendix if it appears in the latter half of the document and contains grid rows
@@ -55,7 +90,7 @@ function splitAndParseAnswerKeys(rawText: string): {
   const hasAnswerGrid = /\b1\s+2\s+3\b/.test(candidateAppendix) && /(?:^|\n)\s*[a-eA-E](?:\s+[a-eA-E]){2,}/.test(candidateAppendix);
 
   if (!hasAnswerGrid) {
-    return { bodyText: normalized, sectionAnswers: new Map(), orderedSections: [] };
+    return { bodyText: normalized, sectionAnswers: new Map(), orderedSections: [], horizontalAnswers };
   }
 
   const bodyText = normalized.slice(0, splitPos);
@@ -107,7 +142,7 @@ function splitAndParseAnswerKeys(rawText: string): {
     orderedSections.push({ key: currentKey, answers: currentMap });
   }
 
-  return { bodyText, sectionAnswers, orderedSections };
+  return { bodyText, sectionAnswers, orderedSections, horizontalAnswers };
 }
 
 function cleanPageNoise(text: string): string {
@@ -119,17 +154,165 @@ function cleanPageNoise(text: string): string {
     .replace(/^\s*Your Daily Dose Of Progress.*$/gim, '')
     .replace(/^\s*\d+\s*(?:st|nd|rd|th)?\s*Medical Year.*$/gim, '')
     .replace(/^\s*\d{2,4}\s*$/gm, '')
+    // Drop standalone mangled OCR key-box footer junk lines without touching short option lines
+    .replace(/^.*$/gm, (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return '';
+      if (/^\(?[a-eA-E][\.\)\:]\s+/.test(trimmed)) return line;
+      if (/^(?:e|i|l)\s{2,}(?:e|i|l)$/i.test(trimmed)) return '';
+      if (/\(o\s*[A-Za-z]{2,}/.test(trimmed) && !/\b[a-z]{4,}\b/.test(trimmed)) return '';
+      return line;
+    })
     .trim();
 }
 
-export function extractExamQuestionsFromText(rawText: string): Array<{
-  questionNumber: number;
-  originalNumber: number;
-  stem: string;
-  options: Array<{ label: string; text: string }>;
-  designatedAnswer: string;
-}> {
-  const { bodyText, sectionAnswers, orderedSections } = splitAndParseAnswerKeys(rawText);
+/**
+ * Clean OCR-mangled colored-circle question badge glyphs or leading question numbers at line starts
+ * (e.g. "@ ", "a Drugs", "w If", "98. ", "① ").
+ */
+function stripLeadingOcrBadge(stem: string): string {
+  return stem
+    .replace(/^\s*(?:Question|Q)?\s*\d{1,3}[\.\)\:\-]\s+/i, '')
+    .replace(/^(?:[\u2460-\u2473\u24EA\u2776-\u277F@©®•\*]+|\([0-9]{1,3}\)|\[[0-9]{1,3}\])\s+/u, '')
+    .replace(/^[a-z]\s+(?=[A-Z][a-zA-Z]{1,})/g, '')
+    .trim();
+}
+
+function findOptionMatchesInBlock(block: string): RegExpMatchArray[] {
+  // Primary: line-start or wide multi-space column gap before option marker
+  const primaryRegex = /(?:^|\n|\s{2,})\(?([a-eA-E])[\.\)\:]\s+(?!g\.)/g;
+  const primaryMatches = Array.from(block.matchAll(primaryRegex));
+
+  // Secondary: handle 2-column OCR lines separated by only 1 space after sentence punctuation (e.g. "...alkaline medium. c. Are highly...")
+  const inlineColRegex = /(?<=[.?!;)\d]\s+)\(?([b-eB-E])[\.\)]\s+(?=[A-Za-z0-9<>\(\["'])/g;
+  const inlineColMatches = Array.from(block.matchAll(inlineColRegex)).filter((m) => {
+    // Exclude uppercase chemical/drug labels like "Drug A.", "Vitamin C.", "Group B."
+    const before = block.slice(Math.max(0, (m.index || 0) - 20), m.index || 0);
+    if (/[A-Z][a-z]+\s+$/.test(before) && /^[A-E]$/.test(m[1])) {
+      return false;
+    }
+    return true;
+  });
+
+  if (inlineColMatches.length > 0 && primaryMatches.some(m => m[1].toUpperCase() === 'A')) {
+    const merged = [...primaryMatches, ...inlineColMatches]
+      .sort((a, b) => (a.index || 0) - (b.index || 0));
+    // Deduplicate overlapping indices
+    const deduped: RegExpMatchArray[] = [];
+    for (const m of merged) {
+      if (deduped.length === 0 || (m.index || 0) > ((deduped[deduped.length - 1].index || 0) + 1)) {
+        deduped.push(m);
+      }
+    }
+    return deduped;
+  }
+
+  // Fallback for single-space inline options: "a) Foo b) Bar c) Baz d) Qux"
+  if (primaryMatches.length < 2) {
+    const inlineOptRegex = /(?:^|\s)\(?([a-eA-E])\)\s+/g;
+    const inlineCandidates = Array.from(block.matchAll(inlineOptRegex));
+    if (inlineCandidates.length >= 2 && inlineCandidates[0][1].toUpperCase() === 'A') {
+      return inlineCandidates;
+    }
+  }
+
+  return primaryMatches;
+}
+
+/**
+ * Fallback question segmenter driven by MCQ option clusters (a..d/e) instead of leading numbers.
+ * Recovers every question cleanly when exam numbers are inside colored circles, garbled by OCR, or omitted.
+ */
+function segmentBlocksByOptionClusters(cleanedText: string): Array<{ rawBlock: string; originalNum: number }> {
+  const lines = cleanedText.split('\n');
+  const results: Array<{ rawBlock: string; originalNum: number }> = [];
+
+  let curStart = 0;
+  let seenLetters = new Set<string>();
+  let lastOptionLine = -1;
+
+  for (let idx = 0; idx < lines.length; idx++) {
+    const line = lines[idx];
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    // Skip footer noise / horizontal answer key strips from forming bogus trailing text
+    if (Object.keys(parseHorizontalAnswerPairs(trimmed)).length >= 3) {
+      if (lastOptionLine >= curStart) {
+        results.push({
+          rawBlock: lines.slice(curStart, lastOptionLine + 1).join('\n'),
+          originalNum: results.length + 1
+        });
+        curStart = idx + 1;
+        seenLetters.clear();
+        lastOptionLine = -1;
+      }
+      continue;
+    }
+
+    const lineStartOpt = trimmed.match(/^\(?([a-eA-E])[\.\)\:]\s+(?!g\.)/);
+    const leadLetter = lineStartOpt ? lineStartOpt[1].toUpperCase() : null;
+
+    if (leadLetter === 'A' && seenLetters.size >= 2 && lastOptionLine >= curStart) {
+      // Split between Question k's last option and Question k+1's stem
+      let splitAt = lastOptionLine + 1;
+      const gapCount = idx - splitAt;
+
+      if (gapCount >= 2) {
+        // Advance past any wrapped lowercase/incomplete continuation line of Question k's last option
+        while (splitAt < idx - 1) {
+          const prevLine = lines[splitAt - 1]?.trim() || '';
+          const candidate = lines[splitAt]?.trim() || '';
+          const prevEndedClean = /[.?!:\)]$/.test(prevLine);
+          const candidateStartsBadgeOrQ = /^(?:[@©®•\*]|\d{1,3}[\.\)\s]|[A-Z])/.test(candidate);
+          if (!prevEndedClean && candidate && !candidateStartsBadgeOrQ) {
+            splitAt++;
+          } else {
+            break;
+          }
+        }
+      }
+
+      if (splitAt > curStart) {
+        const block = lines.slice(curStart, splitAt).join('\n').trim();
+        const leadingNumMatch = block.match(/^(?:Question|Q)?\s*(\d{1,3})(?=[\.\)\:\s])/i);
+        results.push({
+          rawBlock: block,
+          originalNum: leadingNumMatch ? parseInt(leadingNumMatch[1], 10) : results.length + 1
+        });
+      }
+
+      curStart = splitAt;
+      seenLetters.clear();
+      lastOptionLine = -1;
+    }
+
+    const markersInLine = Array.from(trimmed.matchAll(/(?:^|\s{2,}|(?<=[.?!;)\d]\s+))\(?([a-eA-E])[\.\)\:]\s+(?!g\.)/g));
+    if (lineStartOpt || (markersInLine.length > 0 && seenLetters.size > 0)) {
+      for (const m of markersInLine) {
+        seenLetters.add(m[1].toUpperCase());
+      }
+      lastOptionLine = idx;
+    }
+  }
+
+  if (curStart < lines.length) {
+    const tailEnd = lastOptionLine >= curStart ? lastOptionLine + 1 : lines.length;
+    const tail = lines.slice(curStart, tailEnd).join('\n').trim();
+    if (tail.length >= 12) {
+      const leadingNumMatch = tail.match(/^(?:Question|Q)?\s*(\d{1,3})(?=[\.\)\:\s])/i);
+      results.push({
+        rawBlock: tail,
+        originalNum: leadingNumMatch ? parseInt(leadingNumMatch[1], 10) : results.length + 1
+      });
+    }
+  }
+
+  return results;
+}
+
+export function extractExamQuestionsFromText(rawText: string): ParsedExamQuestion[] {
+  const { bodyText, sectionAnswers, orderedSections, horizontalAnswers } = splitAndParseAnswerKeys(rawText);
 
   // Clean page chrome lines while keeping Exam / Written / MCQs boundary markers intact for answer lookup
   const lines = bodyText.replace(/\r\n/g, '\n').split('\n');
@@ -164,23 +347,82 @@ export function extractExamQuestionsFromText(rawText: string): Array<{
     return true;
   });
 
-  if (matches.length === 0) {
-    return [{
-      questionNumber: 1,
-      originalNumber: 1,
-      stem: cleanPageNoise(cleanedText.slice(0, 800)),
-      options: [],
-      designatedAnswer: ''
-    }];
+  // Count how many distinct "a." option blocks exist so circled/missing question numbers never collapse multiple questions into 1
+  const optionStartCount = (cleanedText.match(/(?:^|\n)\s*\(?[aA][\.\)\:]\s+/g) || []).length;
+  const useOptionAnchorFallback =
+    matches.length === 0 || (optionStartCount >= 2 && optionStartCount > matches.length * 1.4);
+
+  if (useOptionAnchorFallback) {
+    const optionBlocks = segmentBlocksByOptionClusters(cleanedText);
+    if (optionBlocks.length === 0) {
+      return [{
+        questionNumber: 1,
+        originalNumber: 1,
+        stem: stripLeadingOcrBadge(cleanPageNoise(cleanedText.slice(0, 800))),
+        options: [],
+        designatedAnswer: ''
+      }];
+    }
+
+    const fallbackQuestions: ParsedExamQuestion[] = [];
+    for (const seg of optionBlocks) {
+      const block = cleanPageNoise(seg.rawBlock);
+      if (block.length < 8) continue;
+
+      let designatedAnswer = horizontalAnswers[seg.originalNum] || '';
+      const ansMatch = block.match(/(?:^|\n|\s)\b(?:Answer|Ans|Key|Correct\s+Answer)\s*[:\-]\s*\(?([A-Ea-e](?:\s*,\s*[A-Ea-e])?)\)?(?!\s*[\.\)])(?=\s|$|\.|,)/i);
+      if (ansMatch) {
+        designatedAnswer = ansMatch[1].toUpperCase();
+      }
+
+      const optMatches = findOptionMatchesInBlock(block);
+      const hasSequentialOptions =
+        optMatches.length >= 2 &&
+        optMatches.some(m => m[1].toUpperCase() === 'A') &&
+        optMatches.some(m => m[1].toUpperCase() === 'B');
+
+      let stem = hasSequentialOptions ? block.slice(0, optMatches[0].index!).trim() : block;
+      const options: Array<{ label: string; text: string }> = [];
+
+      if (hasSequentialOptions) {
+        for (let j = 0; j < optMatches.length; j++) {
+          const curOpt = optMatches[j];
+          const label = curOpt[1].toUpperCase();
+          const optStart = curOpt.index! + curOpt[0].length;
+          const optEnd = j + 1 < optMatches.length ? optMatches[j + 1].index! : block.length;
+          let optText = block.slice(optStart, optEnd).trim();
+          if (ansMatch && optText.includes(ansMatch[0])) {
+            optText = optText.replace(ansMatch[0], '').trim();
+          }
+          optText = cleanPageNoise(optText).replace(/\s+/g, ' ').trim();
+          if (optText.length > 0 && !options.some(o => o.label === label)) {
+            options.push({ label, text: optText });
+          }
+        }
+        options.sort((x, y) => x.label.localeCompare(y.label));
+      }
+
+      if (ansMatch && stem.includes(ansMatch[0])) {
+        stem = stem.replace(ansMatch[0], '').trim();
+      }
+      stem = stripLeadingOcrBadge(stem).replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+      if (stem.length < 8) continue;
+
+      fallbackQuestions.push({
+        questionNumber: fallbackQuestions.length + 1,
+        originalNumber: seg.originalNum,
+        stem,
+        options,
+        designatedAnswer
+      });
+    }
+
+    if (fallbackQuestions.length > 0) {
+      return fallbackQuestions;
+    }
   }
 
-  const questions: Array<{
-    questionNumber: number;
-    originalNumber: number;
-    stem: string;
-    options: Array<{ label: string; text: string }>;
-    designatedAnswer: string;
-  }> = [];
+  const questions: ParsedExamQuestion[] = [];
 
   for (let i = 0; i < matches.length; i++) {
     const currentMatch = matches[i];
@@ -211,18 +453,7 @@ export function extractExamQuestionsFromText(rawText: string): Array<{
       designatedAnswer = ansMatch[1].toUpperCase();
     }
 
-    // Extract MCQ options: supports a. / a) / A. / A) / (a) across lines OR 2-column horizontal gaps (2+ spaces)
-    let optRegex = /(?:^|\n|\s{2,})\(?([a-eA-E])[\.\)\:]\s+/g;
-    let optMatches = Array.from(block.matchAll(optRegex));
-
-    // Single-space inline fallback for "a) Foo b) Bar c) Baz d) Qux"
-    if (optMatches.length < 2) {
-      const inlineOptRegex = /(?:^|\s)\(?([a-eA-E])\)\s+/g;
-      const inlineCandidates = Array.from(block.matchAll(inlineOptRegex));
-      if (inlineCandidates.length >= 2 && inlineCandidates[0][1].toUpperCase() === 'A') {
-        optMatches = inlineCandidates;
-      }
-    }
+    const optMatches = findOptionMatchesInBlock(block);
 
     let stem = block;
     let options: Array<{ label: string; text: string }> = [];
@@ -271,18 +502,22 @@ export function extractExamQuestionsFromText(rawText: string): Array<{
       if (/^(?:diagnosis|identify|describe the slide)\s*$/i.test(block)) continue;
     }
 
-    // Match designated answer from parsed Answer Key section if not present inline
-    if (!designatedAnswer && options.length >= 2 && !inWrittenSection && orderedSections.length > 0) {
-      let matchedMap = latestSectionKey ? sectionAnswers.get(latestSectionKey) : undefined;
-      if (!matchedMap && latestSectionKey) {
-        const found = orderedSections.find(s => s.key.includes(latestSectionKey) || latestSectionKey.includes(s.key));
-        if (found) matchedMap = found.answers;
-      }
-      if (!matchedMap && orderedSections.length === 1) {
-        matchedMap = orderedSections[0].answers;
-      }
-      if (matchedMap && matchedMap[originalNum]) {
-        designatedAnswer = matchedMap[originalNum];
+    // Match designated answer from parsed Answer Key section or horizontal strip if not present inline
+    if (!designatedAnswer && options.length >= 2 && !inWrittenSection) {
+      if (horizontalAnswers[originalNum]) {
+        designatedAnswer = horizontalAnswers[originalNum];
+      } else if (orderedSections.length > 0) {
+        let matchedMap = latestSectionKey ? sectionAnswers.get(latestSectionKey) : undefined;
+        if (!matchedMap && latestSectionKey) {
+          const found = orderedSections.find(s => s.key.includes(latestSectionKey) || latestSectionKey.includes(s.key));
+          if (found) matchedMap = found.answers;
+        }
+        if (!matchedMap && orderedSections.length === 1) {
+          matchedMap = orderedSections[0].answers;
+        }
+        if (matchedMap && matchedMap[originalNum]) {
+          designatedAnswer = matchedMap[originalNum];
+        }
       }
     }
 
@@ -303,4 +538,19 @@ export function extractExamQuestionsFromText(rawText: string): Array<{
   }
 
   return questions;
+}
+
+/**
+ * Detect whether an exam page's extracted text exhibits external-OCR corruption or dropped graphic question numbers/keys.
+ */
+export function hasExamOcrDegradationSignals(text: string): boolean {
+  if (!text) return false;
+  if (/(?:^|\n)\s*[@©®]\s+[A-Z]/.test(text)) return true;
+  if (/(?:^|\n)\s*[a-z]\s+[A-Z][a-z]{2,}/.test(text)) return true;
+  if (/\b(?:75|100|50|25)7\./.test(text) || /\bt\s*,\s*,?of\s*[&©]/i.test(text)) return true;
+  if (/\(o\s*[A-Z]{2,}|il\s+RNl/i.test(text)) return true;
+  const optStarts = (text.match(/(?:^|\n)\s*\(?[aA][\.\)\:]\s+/g) || []).length;
+  const numStarts = (text.match(/(?:^|\n)\s*(?:Question|Q)?\s*\d{1,3}[\.\)\:\s]/g) || []).length;
+  if (optStarts >= 2 && numStarts === 0) return true;
+  return false;
 }

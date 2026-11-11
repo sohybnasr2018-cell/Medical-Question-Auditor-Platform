@@ -468,10 +468,10 @@ function escapeControlCharsInJsonStrings(input: string): string {
   return out;
 }
 
-function parseLlmJsonResponse(rawText: string): AIAuditResponse {
+function parseLlmJsonResponse<T = AIAuditResponse>(rawText: string): T {
   const cleaned = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
   try {
-    return JSON.parse(cleaned) as AIAuditResponse;
+    return JSON.parse(cleaned) as T;
   } catch {
     const firstBrace = cleaned.indexOf('{');
     const lastBrace = cleaned.lastIndexOf('}');
@@ -479,19 +479,22 @@ function parseLlmJsonResponse(rawText: string): AIAuditResponse {
       ? cleaned.slice(firstBrace, lastBrace + 1)
       : cleaned;
     const repaired = escapeControlCharsInJsonStrings(target).replace(/,\s*([}\]])/g, '$1');
-    return JSON.parse(repaired) as AIAuditResponse;
+    return JSON.parse(repaired) as T;
   }
 }
 
-async function callGeminiWithCandidates(
-  promptText: string,
+async function callGeminiWithCandidates<T = AIAuditResponse>(
+  promptOrParts: string | Array<Record<string, any>>,
   candidateModels: string[],
   geminiKey: string,
   timeoutMs: number = 30000,
   temperature: number = 0.1
-): Promise<{ parsed: AIAuditResponse | null; error: string }> {
+): Promise<{ parsed: T | null; error: string }> {
   let lastExternalError = '';
   const maxRounds = 5;
+  const parts = typeof promptOrParts === 'string'
+    ? [{ text: promptOrParts }]
+    : promptOrParts;
 
   for (let round = 0; round < maxRounds; round++) {
     let triedAnyModelThisRound = false;
@@ -513,7 +516,7 @@ async function callGeminiWithCandidates(
               contents: [
                 {
                   role: 'user',
-                  parts: [{ text: promptText }]
+                  parts
                 }
               ],
               generationConfig: {
@@ -527,7 +530,7 @@ async function callGeminiWithCandidates(
             const data = await res.json();
             const rawJson = data.candidates?.[0]?.content?.parts?.[0]?.text;
             if (rawJson) {
-              return { parsed: parseLlmJsonResponse(rawJson), error: '' };
+              return { parsed: parseLlmJsonResponse<T>(rawJson), error: '' };
             }
           } else {
             const errTxt = await res.text().catch(() => '');
@@ -953,4 +956,92 @@ ${AUDIT_RESPONSE_JSON_SCHEMA}`;
 
   // Built-in Deterministic Auditor (only when built_in mode is explicitly selected)
   return runBuiltInMedicalAuditor(stem, options, designatedAnswer, evidenceBundle);
+}
+
+export interface VisionExtractedQuestion {
+  originalNumber: number;
+  stem: string;
+  options: Array<{ label: string; text: string }>;
+  designatedAnswer: string;
+}
+
+export interface VisionExamPageResult {
+  questions: VisionExtractedQuestion[];
+  answerKeyMappings: Array<{ questionNumber: number; answer: string }>;
+  rawTranscribedText: string;
+}
+
+/**
+ * Use multimodal Gemini Vision on an image-backed exam page (PNG) to transcribe every question,
+ * multi-column option list, circled question badge number, numeric symbol (e.g. t1/2, %),
+ * and footer/inline answer-key boxes accurately when embedded/Tesseract text is degraded.
+ */
+export async function extractExamPageWithGeminiVision(
+  pngBuffer: Buffer,
+  pageNumber: number
+): Promise<VisionExamPageResult | null> {
+  const provider = getSetting('ai_provider', 'built_in');
+  const geminiKey = getSetting('gemini_api_key') || process.env.GEMINI_API_KEY;
+  if (provider !== 'gemini' || !geminiKey || !pngBuffer || pngBuffer.length === 0) {
+    return null;
+  }
+
+  const prompt = `You are a high-precision medical exam digitizer inspecting Page ${pageNumber} of a medical examination sheet.
+Extract EVERY question visible on this page verbatim and accurately in reading order (top-to-bottom; reconstruct any 2-column options into A, B, C, D, E order).
+
+CRITICAL ACCURACY RULES:
+1. Read EVERY colored-circle / boxed question number accurately (e.g., 98, 99, 100, 101...).
+2. Preserve EVERY medical symbol, unit, fraction, subscript, and percentage accurately (e.g., t1/2 = 4 hours, 75%, 100%, mg/mL, ng/mL, pKa, <, >) — do NOT drop or misread digits.
+3. For two-column option grids (e.g., "a. ...   c. ..." on row 1, "b. ...   d. ..." on row 2), assign option labels A, B, C, D cleanly by their printed letter.
+4. Read ANY answer key strip / green answer boxes / matrix at the bottom, margin, or end of the page (e.g., "98 b  99 a  100 d ...") and both attach "designatedAnswer" onto matching questions AND list every pair in "answerKeyMappings".
+5. If a page contains only an answer key table with no questions, set "questions": [] and populate "answerKeyMappings".
+6. Output valid JSON strictly adhering to:
+{
+  "questions": [
+    {
+      "originalNumber": number,
+      "stem": string,
+      "options": [{ "label": "A" | "B" | "C" | "D" | "E", "text": string }],
+      "designatedAnswer": string (e.g. "B" or "" if not shown)
+    }
+  ],
+  "answerKeyMappings": [
+    { "questionNumber": number, "answer": "A" | "B" | "C" | "D" | "E" }
+  ],
+  "rawTranscribedText": string
+}`;
+
+  const configuredModel = getSetting('gemini_model', 'gemini-3.5-flash-lite');
+  const visionModels = [
+    'gemini-3-flash-preview',
+    'gemini-3.5-flash',
+    'gemini-3.1-flash-lite',
+    configuredModel,
+    'gemini-3.5-flash-lite',
+    'gemini-3.8-flash'
+  ].filter((v, i, a) => Boolean(v) && a.indexOf(v) === i);
+
+  const parts = [
+    { text: prompt },
+    {
+      inline_data: {
+        mime_type: 'image/png',
+        data: pngBuffer.toString('base64')
+      }
+    }
+  ];
+
+  const { parsed } = await callGeminiWithCandidates<VisionExamPageResult>(
+    parts,
+    visionModels,
+    geminiKey,
+    45000,
+    0.0
+  );
+
+  if (!parsed || (!Array.isArray(parsed.questions) && !Array.isArray(parsed.answerKeyMappings))) {
+    return null;
+  }
+
+  return parsed;
 }
