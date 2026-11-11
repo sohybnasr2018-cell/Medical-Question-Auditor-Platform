@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS questions (
   classification_confidence REAL DEFAULT 0,
   topic TEXT,
   source_page_index INTEGER,
+  image_path TEXT,
+  image_description TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

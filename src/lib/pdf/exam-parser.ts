@@ -10,6 +10,21 @@ export interface ParsedExamQuestion {
   stem: string;
   options: Array<{ label: string; text: string }>;
   designatedAnswer: string;
+  sourcePageIndex?: number;
+  imagePath?: string;
+  imageDescription?: string;
+}
+
+/**
+ * Determine whether a question explicitly refers to an accompanying figure, graph,
+ * microscopic slide, photograph, radiograph, ECG tracing, or visual specimen.
+ */
+export function questionReferencesVisualFigure(
+  stem: string,
+  options?: Array<{ label: string; text: string }>
+): boolean {
+  const combined = `${stem || ''} ${(options || []).map(o => o.text).join(' ')}`;
+  return /\b(?:in\s+the\s+(?:figure|diagram|graph|picture|image|photo|chart|slide|x[\s-]?ray|ecg)|the\s+following\s+(?:figure|diagram|graph|picture|image|photo|micrograph|slide)|which\s+curve|shown\s+(?:in|above|below)|curve\s+[A-Za-z0-9]|blood\s+film\s+picture|microscopic\s+picture|csf\s+picture|slide\s*\d+|describe\s+the\s+slide|figure\s*\d*|fig\.?\s*\d*)\b/i.test(combined);
 }
 
 export function detectMedicalDiscipline(text: string): string {
@@ -147,6 +162,7 @@ function splitAndParseAnswerKeys(rawText: string): {
 
 function cleanPageNoise(text: string): string {
   return text
+    .replace(/<<<PAGE:\d+>>>/g, '')
     .replace(/\.{4,}/g, ' ____ ')
     .replace(/^\s*Question\s+[IVXLC]+\s*[:\-].*$/gim, '')
     .replace(/^\s*(?:Section|Exam Models|Integrated Question Bank|Questions?\s*Bank|Pre-clinical|MCQs)\s*$/gim, '')
@@ -223,11 +239,15 @@ function findOptionMatchesInBlock(block: string): RegExpMatchArray[] {
  * Fallback question segmenter driven by MCQ option clusters (a..d/e) instead of leading numbers.
  * Recovers every question cleanly when exam numbers are inside colored circles, garbled by OCR, or omitted.
  */
-function segmentBlocksByOptionClusters(cleanedText: string): Array<{ rawBlock: string; originalNum: number }> {
+function segmentBlocksByOptionClusters(
+  cleanedText: string
+): Array<{ rawBlock: string; originalNum: number; sourcePageIndex: number }> {
   const lines = cleanedText.split('\n');
-  const results: Array<{ rawBlock: string; originalNum: number }> = [];
+  const results: Array<{ rawBlock: string; originalNum: number; sourcePageIndex: number }> = [];
 
   let curStart = 0;
+  let curPage = 1;
+  let curStartPage = 1;
   let seenLetters = new Set<string>();
   let lastOptionLine = -1;
 
@@ -236,14 +256,25 @@ function segmentBlocksByOptionClusters(cleanedText: string): Array<{ rawBlock: s
     const trimmed = line.trim();
     if (!trimmed) continue;
 
+    const pageTag = trimmed.match(/^<<<PAGE:(\d+)>>>$/);
+    if (pageTag) {
+      curPage = parseInt(pageTag[1], 10);
+      if (idx === curStart || seenLetters.size === 0) {
+        curStartPage = curPage;
+      }
+      continue;
+    }
+
     // Skip footer noise / horizontal answer key strips from forming bogus trailing text
     if (Object.keys(parseHorizontalAnswerPairs(trimmed)).length >= 3) {
       if (lastOptionLine >= curStart) {
         results.push({
           rawBlock: lines.slice(curStart, lastOptionLine + 1).join('\n'),
-          originalNum: results.length + 1
+          originalNum: results.length + 1,
+          sourcePageIndex: curStartPage
         });
         curStart = idx + 1;
+        curStartPage = curPage;
         seenLetters.clear();
         lastOptionLine = -1;
       }
@@ -263,6 +294,10 @@ function segmentBlocksByOptionClusters(cleanedText: string): Array<{ rawBlock: s
         while (splitAt < idx - 1) {
           const prevLine = lines[splitAt - 1]?.trim() || '';
           const candidate = lines[splitAt]?.trim() || '';
+          if (/^<<<PAGE:\d+>>>$/.test(candidate)) {
+            splitAt++;
+            continue;
+          }
           const prevEndedClean = /[.?!:\)]$/.test(prevLine);
           const candidateStartsBadgeOrQ = /^(?:[@©®•\*]|\d{1,3}[\.\)\s]|[A-Z])/.test(candidate);
           if (!prevEndedClean && candidate && !candidateStartsBadgeOrQ) {
@@ -274,15 +309,23 @@ function segmentBlocksByOptionClusters(cleanedText: string): Array<{ rawBlock: s
       }
 
       if (splitAt > curStart) {
-        const block = lines.slice(curStart, splitAt).join('\n').trim();
+        const block = lines.slice(curStart, splitAt).join('\n').replace(/<<<PAGE:\d+>>>/g, '').trim();
         const leadingNumMatch = block.match(/^(?:Question|Q)?\s*(\d{1,3})(?=[\.\)\:\s])/i);
         results.push({
           rawBlock: block,
-          originalNum: leadingNumMatch ? parseInt(leadingNumMatch[1], 10) : results.length + 1
+          originalNum: leadingNumMatch ? parseInt(leadingNumMatch[1], 10) : results.length + 1,
+          sourcePageIndex: curStartPage
         });
       }
 
+      // Resolve page for next stem start line
+      let nextPage = curPage;
+      for (let k = splitAt; k >= 0; k--) {
+        const m = (lines[k] || '').trim().match(/^<<<PAGE:(\d+)>>>$/);
+        if (m) { nextPage = parseInt(m[1], 10); break; }
+      }
       curStart = splitAt;
+      curStartPage = nextPage;
       seenLetters.clear();
       lastOptionLine = -1;
     }
@@ -298,12 +341,13 @@ function segmentBlocksByOptionClusters(cleanedText: string): Array<{ rawBlock: s
 
   if (curStart < lines.length) {
     const tailEnd = lastOptionLine >= curStart ? lastOptionLine + 1 : lines.length;
-    const tail = lines.slice(curStart, tailEnd).join('\n').trim();
+    const tail = lines.slice(curStart, tailEnd).join('\n').replace(/<<<PAGE:\d+>>>/g, '').trim();
     if (tail.length >= 12) {
       const leadingNumMatch = tail.match(/^(?:Question|Q)?\s*(\d{1,3})(?=[\.\)\:\s])/i);
       results.push({
         rawBlock: tail,
-        originalNum: leadingNumMatch ? parseInt(leadingNumMatch[1], 10) : results.length + 1
+        originalNum: leadingNumMatch ? parseInt(leadingNumMatch[1], 10) : results.length + 1,
+        sourcePageIndex: curStartPage
       });
     }
   }
@@ -312,6 +356,13 @@ function segmentBlocksByOptionClusters(cleanedText: string): Array<{ rawBlock: s
 }
 
 export function extractExamQuestionsFromText(rawText: string): ParsedExamQuestion[] {
+  return extractExamQuestionsFromPages([{ pdfPageIndex: 1, text: rawText }]);
+}
+
+export function extractExamQuestionsFromPages(
+  pages: Array<{ pdfPageIndex: number; text: string }>
+): ParsedExamQuestion[] {
+  const rawText = pages.map(p => `<<<PAGE:${p.pdfPageIndex}>>>\n${p.text || ''}`).join('\n');
   const { bodyText, sectionAnswers, orderedSections, horizontalAnswers } = splitAndParseAnswerKeys(rawText);
 
   // Clean page chrome lines while keeping Exam / Written / MCQs boundary markers intact for answer lookup
@@ -413,7 +464,8 @@ export function extractExamQuestionsFromText(rawText: string): ParsedExamQuestio
         originalNumber: seg.originalNum,
         stem,
         options,
-        designatedAnswer
+        designatedAnswer,
+        sourcePageIndex: seg.sourcePageIndex
       });
     }
 
@@ -430,8 +482,12 @@ export function extractExamQuestionsFromText(rawText: string): ParsedExamQuestio
     const startIdx = currentMatch.index! + currentMatch[0].length;
     const endIdx = i + 1 < matches.length ? matches[i + 1].index! : cleanedText.length;
 
-    // Look backward just before this question (or previous slice) to track current Exam Section & Written mode
+    // Look backward just before this question (or previous slice) to track current Exam Section, Page, & Written mode
     const contextLookback = cleanedText.slice(0, currentMatch.index!);
+    const pageTagsBefore = Array.from(contextLookback.matchAll(/<<<PAGE:(\d+)>>>/g));
+    const sourcePageIndex = pageTagsBefore.length > 0
+      ? parseInt(pageTagsBefore[pageTagsBefore.length - 1][1], 10)
+      : (pages[0]?.pdfPageIndex || 1);
     const sectionMatches = Array.from(contextLookback.matchAll(/(?:^|\n)\s*Exam\s+\d+\s+([^\n]+)/gi));
     const latestSectionRaw = sectionMatches.length > 0 ? sectionMatches[sectionMatches.length - 1][1] : '';
     const latestSectionKey = normalizeSectionKey(latestSectionRaw);
@@ -533,7 +589,8 @@ export function extractExamQuestionsFromText(rawText: string): ParsedExamQuestio
       originalNumber: originalNum,
       stem,
       options,
-      designatedAnswer
+      designatedAnswer,
+      sourcePageIndex
     });
   }
 

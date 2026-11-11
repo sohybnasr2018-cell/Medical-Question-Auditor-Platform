@@ -435,6 +435,25 @@ export default function AuditWorkspacePage({
                     {activeFinding.stem}
                   </p>
 
+                  {activeFinding.image_path && (
+                    <div className="bg-white border border-slate-200 rounded-xl p-3.5 space-y-2 shadow-sm">
+                      <div className="text-xs font-bold uppercase tracking-wider text-teal-800">
+                        Attached Question Figure / Visual Evidence
+                      </div>
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={`/api/questions/${activeFinding.question_id}/image`}
+                        alt={`Question ${activeFinding.question_number} figure`}
+                        className="max-h-80 w-auto rounded-lg border border-slate-200 object-contain"
+                      />
+                      {activeFinding.image_description && (
+                        <p className="text-xs text-slate-600 bg-slate-50 p-2.5 rounded border border-slate-100 leading-relaxed">
+                          <strong className="text-slate-700">Visual Figure Analysis:</strong> {activeFinding.image_description}
+                        </p>
+                      )}
+                    </div>
+                  )}
+
                   {/* Proposed Stem Correction if stem had errors */}
                   {activeFinding.proposed_stem && (
                     <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900 space-y-1">

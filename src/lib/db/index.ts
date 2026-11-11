@@ -39,6 +39,16 @@ export function getDb(): DatabaseSync {
       dbInstance.exec(schemaSql);
     }
 
+    // Safe additive schema migrations for existing SQLite databases
+    const qCols = dbInstance.prepare('PRAGMA table_info(questions)').all() as Array<{ name: string }>;
+    const qColNames = new Set(qCols.map(c => c.name));
+    if (!qColNames.has('image_path')) {
+      dbInstance.exec('ALTER TABLE questions ADD COLUMN image_path TEXT;');
+    }
+    if (!qColNames.has('image_description')) {
+      dbInstance.exec('ALTER TABLE questions ADD COLUMN image_description TEXT;');
+    }
+
     // Initialize default settings if not exists (pre-populating from environment variables when deployed on Vercel)
     const checkSettings = dbInstance.prepare("SELECT COUNT(*) as count FROM system_settings").get() as { count: number };
     if (checkSettings.count === 0) {

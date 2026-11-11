@@ -586,15 +586,52 @@ async function callGeminiWithCandidates<T = AIAuditResponse>(
   };
 }
 
+export interface QuestionMediaInput {
+  imageBuffer?: Buffer;
+  mimeType?: string;
+  imageDescription?: string;
+}
+
+function buildGeminiPromptParts(
+  promptText: string,
+  media?: QuestionMediaInput
+): string | Array<Record<string, any>> {
+  if (media?.imageBuffer && media.imageBuffer.length > 0) {
+    return [
+      { text: promptText },
+      {
+        inline_data: {
+          mime_type: media.mimeType || 'image/png',
+          data: media.imageBuffer.toString('base64')
+        }
+      }
+    ];
+  }
+  return promptText;
+}
+
 async function callOpenAiChatJson(
   systemPrompt: string,
   userPrompt: string,
   openaiKey: string,
   model: string,
   timeoutMs: number = 30000,
-  temperature: number = 0.1
+  temperature: number = 0.1,
+  media?: QuestionMediaInput
 ): Promise<{ parsed: AIAuditResponse | null; error: string }> {
   try {
+    const userContent: any = media?.imageBuffer && media.imageBuffer.length > 0
+      ? [
+          { type: 'text', text: userPrompt },
+          {
+            type: 'image_url',
+            image_url: {
+              url: `data:${media.mimeType || 'image/png'};base64,${media.imageBuffer.toString('base64')}`
+            }
+          }
+        ]
+      : userPrompt;
+
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -608,7 +645,7 @@ async function callOpenAiChatJson(
         temperature,
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
+          { role: 'user', content: userContent }
         ]
       })
     });
@@ -673,6 +710,7 @@ async function verifyFlaggedAuditFinding(params: {
   openaiKey?: string;
   geminiModels: string[];
   openaiModel: string;
+  questionMedia?: QuestionMediaInput;
 }): Promise<AIAuditResponse> {
   const {
     stem,
@@ -685,7 +723,8 @@ async function verifyFlaggedAuditFinding(params: {
     geminiKey,
     openaiKey,
     geminiModels,
-    openaiModel
+    openaiModel,
+    questionMedia
   } = params;
 
   const compactPass1 = {
@@ -718,7 +757,7 @@ ${optionsBlock}
 
 DESIGNATED ANSWER KEY:
 ${designatedAnswer || 'Not provided'}
-
+${questionMedia?.imageDescription || questionMedia?.imageBuffer ? `\nATTACHED QUESTION FIGURE / IMAGE NOTES:\n${questionMedia.imageDescription || 'Inspect the attached question image directly.'}\n` : ''}
 PRELIMINARY VERDICT TO AUDIT:
 ${JSON.stringify(compactPass1, null, 2)}
 
@@ -760,7 +799,7 @@ ${AUDIT_RESPONSE_JSON_SCHEMA}`;
     ].filter((v, i, a) => Boolean(v) && a.indexOf(v) === i);
 
     const { parsed } = await callGeminiWithCandidates(
-      `${reviewSystem}\n\n${reviewPrompt}`,
+      buildGeminiPromptParts(`${reviewSystem}\n\n${reviewPrompt}`, questionMedia),
       stage2Models,
       geminiKey,
       45000,
@@ -774,7 +813,8 @@ ${AUDIT_RESPONSE_JSON_SCHEMA}`;
       openaiKey,
       openaiModel,
       40000,
-      0.0
+      0.0,
+      questionMedia
     );
     if (parsed) return parsed;
   }
@@ -790,7 +830,8 @@ export async function auditQuestionWithAI(
   options: Array<{ label: string; text: string }>,
   designatedAnswer: string,
   evidenceBundle: QuestionSearchBundle,
-  providerOverride?: string
+  providerOverride?: string,
+  questionMedia?: QuestionMediaInput
 ): Promise<AIAuditResponse> {
   const provider = providerOverride || getSetting('ai_provider', 'built_in');
   const geminiKey = getSetting('gemini_api_key') || process.env.GEMINI_API_KEY;
@@ -853,7 +894,7 @@ ${optionsBlock}
 
 DESIGNATED ANSWER KEY:
 ${designatedAnswer || 'Not provided'}
-
+${(questionMedia?.imageBuffer || questionMedia?.imageDescription) ? `\nATTACHED QUESTION FIGURE / IMAGE ANALYSIS:\n${questionMedia.imageDescription ? `Visual summary: ${questionMedia.imageDescription}\n` : ''}${questionMedia.imageBuffer ? 'An image/figure for this question is ATTACHED directly in this request. You MUST inspect the visual axes, curves (left/right shifts, Emax plateau, labels), arrows, cells, histology, or radiological features directly in the image rather than guessing visually from text alone!' : ''}\n` : ''}
 EXCLUSIVE REFERENCE EVIDENCE EXCERPTS:
 ${evidenceText || 'No reference excerpts retrieved.'}
 
@@ -867,21 +908,31 @@ ${AUDIT_RESPONSE_JSON_SCHEMA}`;
     }
 
     const configuredModel = getSetting('gemini_model', 'gemini-3.5-flash-lite');
-    const candidateModels = [
-      configuredModel,
-      'gemini-3.5-flash-lite',
-      'gemini-3.1-flash-lite',
-      'gemini-3.1-flash-lite-preview',
-      'gemini-3-flash-preview',
-      'gemini-3.5-flash',
-      'gemini-3.8-flash'
-    ].filter((v, i, a) => Boolean(v) && a.indexOf(v) === i);
+    const candidateModels = (questionMedia?.imageBuffer
+      ? [
+          'gemini-3-flash-preview',
+          'gemini-3.5-flash',
+          'gemini-3.1-flash-lite',
+          configuredModel,
+          'gemini-3.5-flash-lite',
+          'gemini-3.8-flash'
+        ]
+      : [
+          configuredModel,
+          'gemini-3.5-flash-lite',
+          'gemini-3.1-flash-lite',
+          'gemini-3.1-flash-lite-preview',
+          'gemini-3-flash-preview',
+          'gemini-3.5-flash',
+          'gemini-3.8-flash'
+        ]
+    ).filter((v, i, a) => Boolean(v) && a.indexOf(v) === i);
 
     const { parsed: pass1, error } = await callGeminiWithCandidates(
-      `${SYSTEM_INSTRUCTIONS}\n\n${userPrompt}`,
+      buildGeminiPromptParts(`${SYSTEM_INSTRUCTIONS}\n\n${userPrompt}`, questionMedia),
       candidateModels,
       geminiKey,
-      30000,
+      questionMedia?.imageBuffer ? 40000 : 30000,
       0.1
     );
 
@@ -900,7 +951,8 @@ ${AUDIT_RESPONSE_JSON_SCHEMA}`;
         provider: 'gemini',
         geminiKey,
         geminiModels: candidateModels,
-        openaiModel: ''
+        openaiModel: '',
+        questionMedia
       });
     }
 
@@ -919,7 +971,8 @@ ${AUDIT_RESPONSE_JSON_SCHEMA}`;
       openaiKey,
       openaiModel,
       30000,
-      0.1
+      0.1,
+      questionMedia
     );
 
     if (!pass1) {
@@ -937,7 +990,8 @@ ${AUDIT_RESPONSE_JSON_SCHEMA}`;
         provider: 'openai',
         openaiKey,
         geminiModels: [],
-        openaiModel
+        openaiModel,
+        questionMedia
       });
     }
 
@@ -963,6 +1017,8 @@ export interface VisionExtractedQuestion {
   stem: string;
   options: Array<{ label: string; text: string }>;
   designatedAnswer: string;
+  usesVisualFigure?: boolean;
+  visualDescription?: string;
 }
 
 export interface VisionExamPageResult {
@@ -971,18 +1027,31 @@ export interface VisionExamPageResult {
   rawTranscribedText: string;
 }
 
+function getGeminiVisionModels(): string[] {
+  const configuredModel = getSetting('gemini_model', 'gemini-3.5-flash-lite');
+  return [
+    'gemini-3-flash-preview',
+    'gemini-3.5-flash',
+    'gemini-3.1-flash-lite',
+    configuredModel,
+    'gemini-3.5-flash-lite',
+    'gemini-3.8-flash'
+  ].filter((v, i, a) => Boolean(v) && a.indexOf(v) === i);
+}
+
 /**
- * Use multimodal Gemini Vision on an image-backed exam page (PNG) to transcribe every question,
- * multi-column option list, circled question badge number, numeric symbol (e.g. t1/2, %),
- * and footer/inline answer-key boxes accurately when embedded/Tesseract text is degraded.
+ * Use multimodal Gemini Vision on an image-backed exam page (PNG/JPG/WEBP) to transcribe every
+ * question, multi-column option list, badge number, numeric symbol (e.g. t1/2, %), answer-key
+ * box, AND objective visual descriptions of any accompanying figure/graph/slide.
  */
 export async function extractExamPageWithGeminiVision(
-  pngBuffer: Buffer,
-  pageNumber: number
+  imageBuffer: Buffer,
+  pageNumber: number,
+  mimeType: string = 'image/png'
 ): Promise<VisionExamPageResult | null> {
   const provider = getSetting('ai_provider', 'built_in');
   const geminiKey = getSetting('gemini_api_key') || process.env.GEMINI_API_KEY;
-  if (provider !== 'gemini' || !geminiKey || !pngBuffer || pngBuffer.length === 0) {
+  if (provider !== 'gemini' || !geminiKey || !imageBuffer || imageBuffer.length === 0) {
     return null;
   }
 
@@ -994,15 +1063,20 @@ CRITICAL ACCURACY RULES:
 2. Preserve EVERY medical symbol, unit, fraction, subscript, and percentage accurately (e.g., t1/2 = 4 hours, 75%, 100%, mg/mL, ng/mL, pKa, <, >) — do NOT drop or misread digits.
 3. For two-column option grids (e.g., "a. ...   c. ..." on row 1, "b. ...   d. ..." on row 2), assign option labels A, B, C, D cleanly by their printed letter.
 4. Read ANY answer key strip / green answer boxes / matrix at the bottom, margin, or end of the page (e.g., "98 b  99 a  100 d ...") and both attach "designatedAnswer" onto matching questions AND list every pair in "answerKeyMappings".
-5. If a page contains only an answer key table with no questions, set "questions": [] and populate "answerKeyMappings".
-6. Output valid JSON strictly adhering to:
+5. VISUAL FIGURE DETECTION (CRITICAL):
+   - Set "usesVisualFigure": true ONLY if the question refers to or depends on an actual picture, graph, curve plot, diagram, blood film, histology slide, X-ray, ECG, or specimen photo visible on the page (FALSE for text-only MCQs!).
+   - Whenever "usesVisualFigure" is true, provide a precise, factual "visualDescription" describing EVERY visual element needed to solve it (axes labels, exact curve positions/shifts/Emax plateaus for each labeled curve like P, Q, R, S, T vs X, visible parasite/cell structures, stain, spine position, etc.). Do NOT guess or fabricate the final answer key in visualDescription.
+6. If a page contains only an answer key table with no questions, set "questions": [] and populate "answerKeyMappings".
+7. Output valid JSON strictly adhering to:
 {
   "questions": [
     {
       "originalNumber": number,
       "stem": string,
       "options": [{ "label": "A" | "B" | "C" | "D" | "E", "text": string }],
-      "designatedAnswer": string (e.g. "B" or "" if not shown)
+      "designatedAnswer": string (e.g. "B" or "" if not shown),
+      "usesVisualFigure": boolean,
+      "visualDescription": string ("" if usesVisualFigure is false)
     }
   ],
   "answerKeyMappings": [
@@ -1011,29 +1085,19 @@ CRITICAL ACCURACY RULES:
   "rawTranscribedText": string
 }`;
 
-  const configuredModel = getSetting('gemini_model', 'gemini-3.5-flash-lite');
-  const visionModels = [
-    'gemini-3-flash-preview',
-    'gemini-3.5-flash',
-    'gemini-3.1-flash-lite',
-    configuredModel,
-    'gemini-3.5-flash-lite',
-    'gemini-3.8-flash'
-  ].filter((v, i, a) => Boolean(v) && a.indexOf(v) === i);
-
   const parts = [
     { text: prompt },
     {
       inline_data: {
-        mime_type: 'image/png',
-        data: pngBuffer.toString('base64')
+        mime_type: mimeType,
+        data: imageBuffer.toString('base64')
       }
     }
   ];
 
   const { parsed } = await callGeminiWithCandidates<VisionExamPageResult>(
     parts,
-    visionModels,
+    getGeminiVisionModels(),
     geminiKey,
     45000,
     0.0
@@ -1044,4 +1108,40 @@ CRITICAL ACCURACY RULES:
   }
 
   return parsed;
+}
+
+/**
+ * Analyze a figure/slide/graph embedded alongside a digital-text exam question so the auditor
+ * and preview UI have a factual description of the visual evidence.
+ */
+export async function describeQuestionImageWithVision(
+  imageBuffer: Buffer,
+  stem: string,
+  options: Array<{ label: string; text: string }>,
+  mimeType: string = 'image/png'
+): Promise<string | null> {
+  const provider = getSetting('ai_provider', 'built_in');
+  const geminiKey = getSetting('gemini_api_key') || process.env.GEMINI_API_KEY;
+  if (provider !== 'gemini' || !geminiKey || !imageBuffer || imageBuffer.length === 0) {
+    return null;
+  }
+
+  const optionsList = options.map(o => `${o.label}) ${o.text}`).join('\n');
+  const prompt = `You are a medical visual examiner. Describe objectively and concisely (3-6 sentences) what is clinically/scientifically shown in the attached figure for this exam question:
+QUESTION STEM: ${stem}
+${optionsList ? `OPTIONS:\n${optionsList}\n` : ''}
+Describe ONLY what is directly visible in the image (curves, shifts, plateaus, labeled letters, axes, cell/parasite/tissue features, stains, anatomic arrows). Do NOT guess answer letters or make unsupported assumptions. Output strict JSON: { "visualDescription": string }`;
+
+  const { parsed } = await callGeminiWithCandidates<{ visualDescription?: string }>(
+    [
+      { text: prompt },
+      { inline_data: { mime_type: mimeType, data: imageBuffer.toString('base64') } }
+    ],
+    getGeminiVisionModels(),
+    geminiKey,
+    35000,
+    0.0
+  );
+
+  return parsed?.visualDescription ? String(parsed.visualDescription).trim() : null;
 }

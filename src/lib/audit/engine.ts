@@ -1,10 +1,12 @@
-import { getDb } from '@/lib/db';
+import { getDb, PAGES_DIR } from '@/lib/db';
 import { classifyQuestionSubject } from './classifier';
 import { retrieveQuestionEvidence } from '@/lib/search/semantic';
-import { auditQuestionWithAI } from '@/lib/ai/provider';
+import { auditQuestionWithAI, QuestionMediaInput } from '@/lib/ai/provider';
 import { AIAuditResponse } from '@/lib/ai/schemas';
 import { isInvertedPolarityQuestion } from './question-polarity';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 
 export interface AuditProgressUpdate {
   currentQuestion: number;
@@ -246,7 +248,7 @@ export async function executeAuditSession(
   const allReadyBooks = db.prepare("SELECT id, title, subject FROM documents WHERE type = 'reference' AND status = 'ready'").all() as Array<{ id: string; title: string; subject: string }>;
 
   const questions = db.prepare(`
-    SELECT id, question_number, stem, options_json, designated_answer
+    SELECT id, question_number, stem, options_json, designated_answer, image_path, image_description
     FROM questions
     WHERE examination_id = ?
     ORDER BY question_number ASC
@@ -256,6 +258,8 @@ export async function executeAuditSession(
     stem: string;
     options_json: string;
     designated_answer: string;
+    image_path: string | null;
+    image_description: string | null;
   }>;
 
   const totalQuestions = questions.length;
@@ -335,15 +339,48 @@ export async function executeAuditSession(
           options = [];
         }
 
-        const classification = await classifyQuestionSubject(q.stem, options, allReadyBooks);
+        let questionMedia: QuestionMediaInput | undefined;
+        if (q.image_path || q.image_description) {
+          let imageBuffer: Buffer | undefined;
+          let mimeType = 'image/png';
+          if (q.image_path) {
+            const safePath = path.join(PAGES_DIR, path.basename(q.image_path));
+            if (fs.existsSync(safePath)) {
+              imageBuffer = fs.readFileSync(safePath);
+              const lower = safePath.toLowerCase();
+              if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) mimeType = 'image/jpeg';
+              else if (lower.endsWith('.webp')) mimeType = 'image/webp';
+            }
+          }
+          if (imageBuffer || q.image_description) {
+            questionMedia = {
+              imageBuffer,
+              mimeType,
+              imageDescription: q.image_description || undefined
+            };
+          }
+        }
+
+        const retrievalStem = q.image_description
+          ? `${q.stem} ${q.image_description}`
+          : q.stem;
+
+        const classification = await classifyQuestionSubject(retrievalStem, options, allReadyBooks);
         // Always search across ALL selected books while prioritizing subject-matched books
         const evidenceBundle = await retrieveQuestionEvidence(
-          q.stem,
+          retrievalStem,
           options,
           selectedRefIds,
           classification.matchedReferenceBookIds
         );
-        const rawAiResult = await auditQuestionWithAI(q.stem, options, q.designated_answer, evidenceBundle, providerMode);
+        const rawAiResult = await auditQuestionWithAI(
+          q.stem,
+          options,
+          q.designated_answer,
+          evidenceBundle,
+          providerMode,
+          questionMedia
+        );
         const aiResult = sanitizeAiResponse(rawAiResult, q.designated_answer || '', q.stem, options.length > 0);
 
         return { q, options, classification, aiResult };

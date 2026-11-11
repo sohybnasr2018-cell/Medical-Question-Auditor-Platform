@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import fs from 'node:fs';
-import crypto from 'node:crypto';
 import { getDb } from '@/lib/db';
-import { extractExamQuestionsFromText } from '@/lib/pdf/exam-parser';
-import { extractExaminationQuestionsWithVisionFallback } from '@/lib/pdf/exam-pipeline';
+import { extractExamQuestionsFromPages } from '@/lib/pdf/exam-parser';
+import {
+  extractExaminationQuestionsWithVisionFallback,
+  extractExaminationFromDirectImageUpload,
+  saveParsedExamQuestions
+} from '@/lib/pdf/exam-pipeline';
 
 export const maxDuration = 300;
 
@@ -88,20 +91,35 @@ export async function POST(req: NextRequest) {
       page_type: 'digital' | 'scanned' | 'mixed';
     }>;
 
-    let parsedQuestions = extractExamQuestionsFromText(docPages.map(p => p.extracted_text || '').join('\n'));
+    let parsedQuestions = extractExamQuestionsFromPages(
+      docPages.map(p => ({ pdfPageIndex: p.pdf_page_index, text: p.extracted_text || '' }))
+    );
+    let attachedImagesCount = 0;
+
     if (exam.file_path && fs.existsSync(exam.file_path)) {
-      const pdfBuffer = fs.readFileSync(exam.file_path);
-      const outcome = await extractExaminationQuestionsWithVisionFallback(
-        pdfBuffer,
-        docPages.map(p => ({
-          pdfPageIndex: p.pdf_page_index,
-          text: p.extracted_text || '',
-          ocrApplied: p.ocr_applied === 1,
-          ocrConfidence: p.ocr_confidence || 0,
-          pageType: p.page_type || 'digital'
-        }))
-      );
+      const fileBuffer = fs.readFileSync(exam.file_path);
+      const isImageFile = /\.(png|jpe?g|webp)$/i.test(exam.file_path);
+
+      const outcome = isImageFile
+        ? await extractExaminationFromDirectImageUpload(
+            fileBuffer,
+            exam.file_path.toLowerCase().endsWith('.png') ? 'image/png' : exam.file_path.toLowerCase().endsWith('.webp') ? 'image/webp' : 'image/jpeg',
+            exam.document_id
+          )
+        : await extractExaminationQuestionsWithVisionFallback(
+            fileBuffer,
+            docPages.map(p => ({
+              pdfPageIndex: p.pdf_page_index,
+              text: p.extracted_text || '',
+              ocrApplied: p.ocr_applied === 1,
+              ocrConfidence: p.ocr_confidence || 0,
+              pageType: p.page_type || 'digital'
+            })),
+            exam.document_id
+          );
+
       parsedQuestions = outcome.questions;
+      attachedImagesCount = outcome.attachedImagesCount;
 
       if (outcome.updatedPageTexts.size > 0) {
         const updatePageText = db.prepare(`
@@ -116,29 +134,13 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    db.prepare('DELETE FROM questions WHERE examination_id = ?').run(exam.id);
-    const insertQ = db.prepare(`
-      INSERT INTO questions (
-        id, examination_id, question_number, stem, options_json, designated_answer
-      ) VALUES (?, ?, ?, ?, ?, ?)
-    `);
-    for (const q of parsedQuestions) {
-      insertQ.run(
-        crypto.randomUUID(),
-        exam.id,
-        q.questionNumber,
-        q.stem,
-        JSON.stringify(q.options),
-        q.designatedAnswer || null
-      );
-    }
-
-    db.prepare('UPDATE examinations SET total_questions = ? WHERE id = ?').run(parsedQuestions.length, exam.id);
+    saveParsedExamQuestions(exam.id, parsedQuestions);
 
     return NextResponse.json({
       success: true,
       questionCount: parsedQuestions.length,
-      message: `Re-extracted ${parsedQuestions.length} questions from "${exam.title}".`
+      attachedImagesCount,
+      message: `Re-extracted ${parsedQuestions.length} questions (${attachedImagesCount} with images) from "${exam.title}".`
     });
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 });

@@ -277,17 +277,17 @@ export default function ExaminationLibraryPage() {
         <form onSubmit={handleUploadSubmit} className="space-y-4">
           <div>
             <label className="block text-xs font-semibold text-slate-700 mb-1">
-              Select Examination PDF
+              Select Examination File (PDF or Image)
             </label>
             <input
               type="file"
-              accept=".pdf"
+              accept=".pdf,.png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"
               required
               onChange={(e) => {
                 const f = e.target.files?.[0] || null;
                 setUploadFile(f);
                 if (f && !uploadTitle) {
-                  setUploadTitle(f.name.replace(/\.pdf$/i, ''));
+                  setUploadTitle(f.name.replace(/\.(?:pdf|png|jpe?g|webp)$/i, ''));
                 }
               }}
               className="w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-teal-50 file:text-teal-700 hover:file:bg-teal-100 cursor-pointer"
@@ -372,6 +372,24 @@ export default function ExaminationLibraryPage() {
                     </span>
                   </div>
                   <p className="text-sm text-slate-800">{q.stem}</p>
+                  {q.image_path && (
+                    <div className="mt-2 bg-white border border-slate-200 rounded-lg p-2.5 space-y-1.5">
+                      <div className="text-[11px] font-bold uppercase tracking-wider text-teal-700">
+                        Attached Question Figure / Image
+                      </div>
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={`/api/questions/${q.id}/image`}
+                        alt={`Question ${q.question_number} figure`}
+                        className="max-h-72 w-auto rounded border border-slate-100 object-contain"
+                      />
+                      {q.image_description && (
+                        <p className="text-[11px] text-slate-500 leading-relaxed">
+                          <strong>Visual Analysis:</strong> {q.image_description}
+                        </p>
+                      )}
+                    </div>
+                  )}
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-2 text-xs">
                     {opts.map((opt: any) => (
                       <div

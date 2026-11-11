@@ -28,7 +28,10 @@ export async function GET(
         q.designated_answer,
         q.detected_primary_subject,
         q.detected_secondary_subjects,
-        q.topic
+        q.topic,
+        q.source_page_index,
+        q.image_path,
+        q.image_description
       FROM audit_findings f
       JOIN questions q ON q.id = f.question_id
       WHERE f.audit_session_id = ?

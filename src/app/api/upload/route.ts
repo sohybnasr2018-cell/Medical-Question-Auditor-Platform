@@ -4,7 +4,11 @@ import { parsePdfDocument } from '@/lib/pdf/parser';
 import { ocrPdfScannedPages } from '@/lib/pdf/ocr';
 import { indexDocumentPages } from '@/lib/search/indexer';
 import { detectMedicalDiscipline } from '@/lib/pdf/exam-parser';
-import { extractExaminationQuestionsWithVisionFallback } from '@/lib/pdf/exam-pipeline';
+import {
+  extractExaminationQuestionsWithVisionFallback,
+  extractExaminationFromDirectImageUpload,
+  saveParsedExamQuestions
+} from '@/lib/pdf/exam-pipeline';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -27,8 +31,18 @@ export async function POST(req: NextRequest) {
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    if (buffer.length < 5 || buffer.toString('utf8', 0, 4) !== '%PDF') {
-      return NextResponse.json({ error: 'Uploaded file is not a valid PDF document.' }, { status: 400 });
+    const isPdf = buffer.length >= 5 && buffer.toString('utf8', 0, 4) === '%PDF';
+    const isPng = buffer.length >= 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47;
+    const isJpeg = buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff;
+    const isWebp = buffer.length >= 12 && buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP';
+    const imageMimeType = isPng ? 'image/png' : isJpeg ? 'image/jpeg' : isWebp ? 'image/webp' : '';
+
+    if (!isPdf && !(docType === 'examination' && imageMimeType)) {
+      return NextResponse.json({
+        error: docType === 'examination'
+          ? 'Uploaded file must be a valid PDF or image (PNG, JPG, WEBP).'
+          : 'Uploaded file is not a valid PDF document.'
+      }, { status: 400 });
     }
 
     const docId = crypto.randomUUID();
@@ -40,7 +54,7 @@ export async function POST(req: NextRequest) {
     fs.writeFileSync(filePath, buffer);
 
     const db = getDb();
-    const title = customTitle || originalFilename.replace(/\.pdf$/i, '');
+    const title = customTitle || originalFilename.replace(/\.(?:pdf|png|jpe?g|webp)$/i, '');
 
     // Auto-detect subject if not provided
     if (!customSubject) {
@@ -59,12 +73,51 @@ export async function POST(req: NextRequest) {
       originalFilename,
       filePath,
       buffer.length,
-      0,
+      imageMimeType ? 1 : 0,
       title,
       customSubject || null,
       customCategory,
       'extracting_text'
     );
+
+    if (imageMimeType && docType === 'examination') {
+      const outcome = await extractExaminationFromDirectImageUpload(buffer, imageMimeType, docId);
+      const transcribedText = outcome.updatedPageTexts.get(1) || '';
+
+      db.prepare(`
+        INSERT INTO document_pages (
+          id, document_id, pdf_page_index, printed_page_number, extracted_text,
+          has_native_text, ocr_applied, ocr_confidence, page_type, word_count,
+          char_count, flagged_uncertain
+        ) VALUES (?, ?, 1, '1', ?, 0, 1, 99, 'scanned', ?, ?, 0)
+      `).run(
+        crypto.randomUUID(),
+        docId,
+        transcribedText,
+        transcribedText.split(/\s+/).filter(Boolean).length,
+        transcribedText.length
+      );
+
+      const examId = crypto.randomUUID();
+      db.prepare(`
+        INSERT INTO examinations (id, document_id, title, total_questions, status)
+        VALUES (?, ?, ?, ?, 'parsed')
+      `).run(examId, docId, title, outcome.questions.length);
+
+      saveParsedExamQuestions(examId, outcome.questions);
+      db.prepare("UPDATE documents SET ocr_confidence_avg = 99, status = 'ready' WHERE id = ?").run(docId);
+
+      return NextResponse.json({
+        success: true,
+        documentId: docId,
+        examinationId: examId,
+        type: 'examination',
+        title,
+        questionCount: outcome.questions.length,
+        attachedImagesCount: outcome.attachedImagesCount,
+        status: 'parsed'
+      });
+    }
 
     const parseResult = await parsePdfDocument(buffer, title);
 
@@ -176,7 +229,7 @@ export async function POST(req: NextRequest) {
         status: 'ready'
       });
     } else {
-      const outcome = await extractExaminationQuestionsWithVisionFallback(buffer, finalPagesForPipeline);
+      const outcome = await extractExaminationQuestionsWithVisionFallback(buffer, finalPagesForPipeline, docId);
       const parsedQuestions = outcome.questions;
 
       if (outcome.updatedPageTexts.size > 0) {
@@ -192,32 +245,13 @@ export async function POST(req: NextRequest) {
       }
 
       const examId = crypto.randomUUID();
-
-      const insertExam = db.prepare(`
+      db.prepare(`
         INSERT INTO examinations (
           id, document_id, title, total_questions, status
         ) VALUES (?, ?, ?, ?, 'parsed')
-      `);
+      `).run(examId, docId, title, parsedQuestions.length);
 
-      insertExam.run(examId, docId, title, parsedQuestions.length);
-
-      const insertQ = db.prepare(`
-        INSERT INTO questions (
-          id, examination_id, question_number, stem, options_json, designated_answer
-        ) VALUES (?, ?, ?, ?, ?, ?)
-      `);
-
-      for (const q of parsedQuestions) {
-        insertQ.run(
-          crypto.randomUUID(),
-          examId,
-          q.questionNumber,
-          q.stem,
-          JSON.stringify(q.options),
-          q.designatedAnswer || null
-        );
-      }
-
+      saveParsedExamQuestions(examId, parsedQuestions);
       db.prepare("UPDATE documents SET status = 'ready' WHERE id = ?").run(docId);
 
       return NextResponse.json({
@@ -227,6 +261,7 @@ export async function POST(req: NextRequest) {
         type: 'examination',
         title,
         questionCount: parsedQuestions.length,
+        attachedImagesCount: outcome.attachedImagesCount,
         status: 'parsed'
       });
     }
