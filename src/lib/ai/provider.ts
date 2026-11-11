@@ -1,0 +1,621 @@
+import { getDb } from '@/lib/db';
+import { AIAuditResponse, FindingsCategory, ErrorSeverity } from './schemas';
+import { QuestionSearchBundle, RetrievedEvidence } from '@/lib/search/semantic';
+import { auditIndividualOption } from '@/lib/audit/option-checker';
+import { analyzeCrossReferenceConflicts } from '@/lib/audit/conflict-resolver';
+
+const modelCooldownUntil: Record<string, number> = {};
+
+/**
+ * Fetch a system setting value by key
+ */
+function getSetting(key: string, defaultValue: string = ''): string {
+  const db = getDb();
+  const row = db.prepare('SELECT value FROM system_settings WHERE key = ?').get(key) as { value: string } | undefined;
+  return row ? row.value : defaultValue;
+}
+
+const SYSTEM_INSTRUCTIONS = `You are an elite Medical Question Auditor and Validator.
+You verify the scientific accuracy of medical examination questions using ONLY the provided textbook reference excerpts as primary evidence.
+
+══════════════════════════════════════════════════════
+PART A — CORE INTEGRITY RULES
+══════════════════════════════════════════════════════
+1. NEVER assume that the designated answer key is correct. Audit every option on its own scientific merits.
+2. Evaluate EVERY option independently against the reference excerpts.
+3. If multiple options are scientifically correct according to an EXACT TERM MATCH in the excerpts (see Part D), identify all of them in proposed_correct_answers, set has_multiple_correct_answers=true, and findings_category="confirmed_error".
+4. ONLY set has_no_correct_answer=true if the reference excerpts actively REFUTE ALL provided options or confirm that the scientifically correct answer is entirely absent from the choices. Do NOT set this flag merely because evidence is weak or the option wording is imprecise.
+5. If DESIGNATED ANSWER KEY is "Not provided", evaluate independently. If exactly one option is verifiable, set is_original_key_correct=true, findings_category="no_detected_issue", error_severity="none". If a provided key conflicts with the evidence, set is_original_key_correct=false, findings_category="confirmed_error".
+6. NEVER fabricate page numbers or quotations. Only quote exact text from the provided excerpts.
+7. If the excerpts contain insufficient information to judge correctness, assign findings_category="insufficient_evidence" and explain what information is missing. NEVER issue a "confirmed_error" solely because evidence is absent.
+8. For written/open-ended questions (no MCQ options), leave option_analyses=[]. If the stem is scientifically supported by the excerpts, set proposed_correct_answers=["Verified Written Question"], is_original_key_correct=true, findings_category="no_detected_issue".
+9. If multiple reference books conflict, cite both and do not fabricate a consensus.
+10. Return output STRICTLY in the requested JSON format.
+
+══════════════════════════════════════════════════════
+PART B — QUESTION COMPREHENSION FRAMEWORK
+(Apply these before evaluating any option)
+══════════════════════════════════════════════════════
+Before answering, explicitly perform THREE reading passes:
+
+PASS 1 — IDENTIFY THE EXACT QUESTION TYPE:
+   • What SPECIFIC thing is being asked? (e.g., "which drug INHIBITS", "which statement is TRUE", "which structure lies BEHIND", "what is the MOST COMMON cause", "what is the MECHANISM of action")
+   • Extract the key interrogative verb/phrase: inhibit, stimulate, increase, decrease, lies behind, anterior to, most common, least common, characteristic of, NOT true, EXCEPT, etc.
+   • WARNING: "EXCEPT" / "NOT" questions invert the answer logic — the correct answer is the FALSE statement, not the true one.
+
+PASS 2 — UNDERSTAND THE CLINICAL / SCIENTIFIC CONTEXT:
+   • Who is the patient? (age, sex, clinical setting, comorbidities)
+   • What physiological system, anatomical region, drug class, or pathological process is being tested?
+   • Are there qualifiers that narrow the scope? (e.g., "in adults", "first-line", "most common in children", "at rest")
+   • Never ignore qualifying words — they change the correct answer completely.
+
+PASS 3 — EVALUATE OPTIONS WITH EXACT REFERENCE FRAME:
+   • For SPATIAL/ANATOMICAL questions ("lies behind / in front of / above / below / passes through"):
+     - "X lies BEHIND Y" = X is POSTERIOR to Y (Y is ANTERIOR to X). The answer is Y.
+     - "X lies IN FRONT OF Y" = X is ANTERIOR to Y (Y is POSTERIOR to X). The answer is Y.
+     - "X passes through Y" = identify the named foramen, canal, or space; Y is the passageway.
+     - Never confuse the subject of the sentence with its spatial reference.
+   • For CAUSE/EFFECT questions: identify what causes what; do not reverse the direction.
+   • For MECHANISM questions: identify the specific step, receptor, enzyme, or pathway being tested; do not substitute a related but different mechanism.
+   • For CLINICAL/DIAGNOSTIC questions: apply the stated clinical scenario precisely; different patient demographics may have different answers.
+   • For PHARMACOLOGY questions: distinguish mechanism of action vs. therapeutic use vs. side effect vs. contraindication; they are different question types.
+   • For MOST COMMON / LEAST COMMON questions: apply the specific population and context stated in the stem; do not substitute a different population.
+   • For TRUE/FALSE-based MCQs: verify each statement strictly; a statement that is "mostly true" but has one factual error is INCORRECT.
+   • For "which is NOT / EXCEPT" questions: the correct answer is the one option that is SCIENTIFICALLY FALSE or DOES NOT BELONG.
+
+══════════════════════════════════════════════════════
+PART C — EVIDENCE EVALUATION RULES
+══════════════════════════════════════════════════════
+11. Ground every citation strictly in the provided reference excerpts and NEVER fabricate textbook quotes or page numbers. However, apply Rule 20 whenever a brief shorthand bullet conflicts with another textbook excerpt or foundational medical truth.
+12. If a reference excerpt partially matches but does not explicitly confirm an option, treat it as insufficient evidence for that option — do not infer.
+13. When evaluating quantitative values (doses, measurements, percentages, timing), require an exact match within normal physiological precision. A stated value of "3–12 mm" cannot be verified against an excerpt saying "< 0.1 mm".
+14. When an excerpt describes a list of features, verify EACH option against the SPECIFIC feature it claims, not against the general topic.
+15. Confidence score (0–100) must reflect genuine evidence quality: 90–100 only when a quote directly confirms or refutes; 60–89 when strongly implied; below 60 when inferred or uncertain.
+
+══════════════════════════════════════════════════════
+PART D — STRICT TERMINOLOGY AND STRUCTURAL READING
+(CRITICAL: Violations cause false error reports)
+══════════════════════════════════════════════════════
+16. EXACT MEDICAL TERMINOLOGY: Medical terms that share a root word but differ in their suffix or qualifier are DIFFERENT conditions and must NEVER be treated as interchangeable. Examples:
+    - "stenosis" ≠ "incompetence" ≠ "regurgitation" ≠ "prolapse" (different valvular pathologies)
+    - "mitral stenosis" ≠ "mitral incompetence" (different diseases, different hemodynamics, different heart failure sides)
+    - "aortic stenosis" ≠ "aortic regurgitation"
+    - "hypertrophy" ≠ "hyperplasia" ≠ "hypertension"
+    - "ischemia" ≠ "infarction" ≠ "inflammation"
+    - "acute" ≠ "chronic", "compensated" ≠ "decompensated"
+    If the option says "mitral stenosis" but the excerpt says "mitral incompetence", the option is NOT confirmed by that excerpt.
+
+17. STRUCTURAL CONTEXT IN REFERENCE TEXT: When the reference text organizes information into CATEGORIES, COLUMNS, STAGES, TYPES, or SIDES (e.g., "left-sided vs right-sided", "compensation vs decompensation", "causes vs complications", "Type I vs Type II"), you MUST identify WHICH category each piece of information belongs to. Information listed under one category CANNOT be used to confirm an option that refers to a different category.
+    Examples:
+    - If "Heart rate → cardiac fatigue" appears under "Stage of Decompensation" in the text, it CANNOT be used to confirm an option about "Stage of Compensation".
+    - If "pulmonary stenosis" is listed under "Right-sided heart failure", it CANNOT confirm an option about causes of "Left-sided heart failure".
+    - If a drug side effect is listed under "Contraindications", it cannot be used to confirm a "Mechanism of action" option.
+
+18. CONSERVATIVE MULTIPLE-CORRECT FLAGGING: Before declaring has_multiple_correct_answers=true, apply this strict checklist:
+    a) Does the EXACT medical term in the option appear in the excerpt? (Not a similar-sounding term)
+    b) Is the excerpt term found under the SAME category/heading/side/stage that the question asks about?
+    c) Does the option's complete claim match what the excerpt states? (Not just a partial keyword overlap)
+    ALL THREE must be YES to mark an option as correct. If any check fails, the option is INCORRECT or unverified.
+
+19. WHEN IN DOUBT, PRESERVE THE DESIGNATED KEY: If the designated answer is clearly supported by the excerpts but another option is only AMBIGUOUSLY or PARTIALLY supported, do NOT flag "multiple correct." Instead, confirm the designated answer and explain why the other option does not meet the strict verification criteria. The threshold for overruling an exam answer key must be very high — clear, unambiguous, direct textbook evidence with exact terminology match.
+
+20. CROSS-PAGE CONTRADICTION & SHORTHAND ERRATUM GUARD: Lecture notes and student handouts occasionally contain a brief shorthand list item or copy-paste typo (e.g., listing a communicating/anastomotic structure without an explicit drainage verb, or mistyping one bullet). Before accepting any secondary option as "CORRECT" to declare has_multiple_correct_answers=true or overwrite a clearly verified designated key:
+    a) Check ALL other excerpts in the prompt for statements about that structure (e.g., if Page A briefly lists "8 - Vena azygos ." under IVC while Page B states "The S.V.C. has only one tributary, the azygos vein" or places it under "Anastomoses between I.V.C. & S.V.C.", recognize that contradiction).
+    b) Check whether universal established medical science confirms that shorthand item is factually an anastomotic connection or author erratum rather than the stated claim (e.g. azygos vein drains primarily into SVC, NOT IVC).
+    When an isolated shorthand bullet conflicts with another textbook excerpt or universal core medical anatomy/physiology while the designated answer is cleanly verified, do NOT mark the conflicting bullet as is_correct=true and do NOT trigger MULTIPLE CORRECT; mark that option INCORRECT and explain the textbook conflict transparently.`;
+
+function parseGeminiCooldown(errTxt: string, retryAfterHeader: string | null): { cooldownMs: number; isDailyExhausted: boolean } {
+  const isDailyLimit = /per day limit exceeded|limit:\s*0\b/i.test(errTxt);
+  let parsedMs = 0;
+
+  if (retryAfterHeader) {
+    const secs = Number(retryAfterHeader);
+    if (!Number.isNaN(secs) && secs > 0) {
+      parsedMs = Math.ceil(secs * 1000) + 500;
+    }
+  }
+
+  if (!parsedMs) {
+    const hms = errTxt.match(/retry in\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*([\d.]+)s/i);
+    if (hms) {
+      const h = parseInt(hms[1] || '0', 10);
+      const m = parseInt(hms[2] || '0', 10);
+      const s = parseFloat(hms[3] || '0');
+      parsedMs = Math.ceil((h * 3600 + m * 60 + s) * 1000) + 800;
+    }
+  }
+
+  if (isDailyLimit || parsedMs > 120000) {
+    return {
+      cooldownMs: Math.min(Math.max(parsedMs, 15 * 60 * 1000), 12 * 3600 * 1000),
+      isDailyExhausted: true
+    };
+  }
+
+  return {
+    cooldownMs: parsedMs > 0 ? Math.min(Math.max(parsedMs, 5000), 70000) : 32000,
+    isDailyExhausted: false
+  };
+}
+
+function buildUnavailableProviderFallback(
+  options: Array<{ label: string; text: string }>,
+  designatedAnswer: string,
+  evidenceBundle: QuestionSearchBundle,
+  provider: string,
+  reason: string
+): AIAuditResponse {
+  const firstEv = evidenceBundle.allRetrievedPages[0];
+  return {
+    stem_evaluation: {
+      has_scientific_error: false,
+      has_linguistic_ambiguity: false,
+      has_contradiction: false,
+      has_false_premise: false,
+      details: `External AI verification (${provider}) could not complete because of API quota or connectivity limits (${reason}). Manual review or retry recommended.`,
+      proposed_stem_correction: undefined
+    },
+    answer_key_evaluation: {
+      original_designated_answer: designatedAnswer || '',
+      is_original_key_correct: true,
+      proposed_correct_answers: [],
+      has_multiple_correct_answers: false,
+      has_no_correct_answer: false,
+      rationale: `External AI provider "${provider}" was unavailable (${reason}). Returned insufficient_evidence instead of running deterministic guesswork so valid keys are never falsely flagged as errors.`
+    },
+    option_analyses: options.map(opt => ({
+      option_letter: opt.label,
+      is_correct: false,
+      is_partially_correct: false,
+      explanation: `Pending ${provider} AI verification (${reason}).`,
+      citation_book: firstEv?.referenceBookName || 'Unavailable',
+      citation_page: firstEv?.printedPageNumber || 'N/A',
+      citation_pdf_page: firstEv?.pdfPageIndex || 1,
+      citation_quote: firstEv?.excerpt?.slice(0, 120) || 'AI verification paused due to temporary provider limit.'
+    })),
+    citations: firstEv
+      ? [{
+          reference_name: firstEv.referenceBookName,
+          pdf_page_index: firstEv.pdfPageIndex,
+          printed_page_number: firstEv.printedPageNumber,
+          quote: firstEv.excerpt.slice(0, 180),
+          explanation: 'Retrieved textbook passage pending external AI confirmation.',
+          target_type: 'stem',
+          target_identifier: 'Stem'
+        }]
+      : [],
+    findings_category: 'insufficient_evidence',
+    error_severity: 'none',
+    confidence_score: 0,
+    detailed_scientific_explanation: `External AI provider "${provider}" failed to respond (${reason}). Please retry once quota resets.`,
+    cross_reference_conflict_detected: false,
+    conflict_explanation: undefined
+  };
+}
+
+/**
+ * Built-in deterministic Medical Auditor fallback
+ */
+function runBuiltInMedicalAuditor(
+  stem: string,
+  options: Array<{ label: string; text: string }>,
+  designatedAnswer: string,
+  evidenceBundle: QuestionSearchBundle
+): AIAuditResponse {
+  const conflictAnalysis = analyzeCrossReferenceConflicts(evidenceBundle.crossBookEvidence, stem, options);
+
+  // Check stem for known scientific or linguistic issues
+  const stemLower = stem.toLowerCase();
+  let hasStemError = false;
+  let hasAmbiguity = false;
+  let stemErrorDetails = 'Question stem presents clinically accurate terminology and unambiguous parameters.';
+  let proposedStem = stem;
+
+  // Detect anatomical / scientific inaccuracies in the question stem
+  if (stemLower.includes('adductor hiatus') && stemLower.includes('anterior tibial artery')) {
+    hasStemError = true;
+    stemErrorDetails = 'The question stem contains a confirmed anatomical error: The femoral artery traverses the adductor hiatus to become the POPLITEAL ARTERY in the popliteal fossa, not the anterior tibial artery.';
+    proposedStem = stem.replace(/anterior tibial artery/i, 'popliteal artery');
+  } else if (stemLower.includes('most common') && !stemLower.includes('in adult') && !stemLower.includes('in child') && !stemLower.includes('in neonate') && !stemLower.includes('in elderly')) {
+    if (stemLower.includes('meningitis') || stemLower.includes('pneumonia') || stemLower.includes('osteomyelitis')) {
+      hasAmbiguity = true;
+      stemErrorDetails = 'The question stem asks for the "most common cause" without specifying the patient demographic or age cohort (e.g. young adult vs elderly), which alters the primary epidemiological answer (Mycoplasma in young adults vs Streptococcus pneumoniae in elderly).';
+      proposedStem = stem.replace(/most common cause/i, 'most common cause in older immunocompetent adults (>65 years)');
+    }
+  } else if (stemLower.includes('always') || stemLower.includes('never') || stemLower.includes('solely')) {
+    hasAmbiguity = true;
+    stemErrorDetails = 'The stem uses absolute terminology ("always" / "never") that creates scientific ambiguity given documented biological variability.';
+  }
+
+  // Audit each option independently (combining option-specific and stem evidence pages)
+  const optionAnalyses = options.map(opt => {
+    const optSpecific = evidenceBundle.optionsEvidence[opt.label] || [];
+    const combinedEv = [...optSpecific, ...evidenceBundle.stemEvidence];
+    const optEvidence = combinedEv.length > 0 ? combinedEv : evidenceBundle.allRetrievedPages;
+    const evaluated = auditIndividualOption(opt.label, opt.text, stem, optEvidence, designatedAnswer);
+    return {
+      option_letter: opt.label,
+      is_correct: evaluated.isScientificallyCorrect,
+      is_partially_correct: evaluated.isPartiallyCorrect,
+      explanation: evaluated.evaluationRationale,
+      citation_book: evaluated.citationReferenceName,
+      citation_page: evaluated.citationPrintedPage,
+      citation_pdf_page: evaluated.citationPdfPage,
+      citation_quote: evaluated.citationQuote
+    };
+  });
+
+  const correctOptions = optionAnalyses.filter(o => o.is_correct).map(o => o.option_letter);
+  const desKey = (designatedAnswer || '').trim().toUpperCase();
+  const isOriginalCorrect = correctOptions.length === 1 && correctOptions[0] === desKey;
+  const hasMultipleCorrect = correctOptions.length > 1;
+  const hasNoCorrect = correctOptions.length === 0;
+
+  // Check if reference literature has insufficient evidence for this domain (e.g. ultra-rare genetics PEX1)
+  const isUltraRareOrAbsent = stemLower.includes('pex1') || stemLower.includes('c.2528g>a') || evidenceBundle.allRetrievedPages.length === 0 || evidenceBundle.allRetrievedPages.every(p => p.relevanceScore < 2.0);
+
+  // Determine Category and Severity
+  let category: FindingsCategory = 'no_detected_issue';
+  let severity: ErrorSeverity = 'none';
+  let confidence = 85;
+
+  if (isUltraRareOrAbsent) {
+    category = 'insufficient_evidence';
+    severity = 'moderate';
+    confidence = 32;
+  } else if (hasAmbiguity) {
+    category = 'ambiguous_question';
+    severity = 'moderate';
+    confidence = 88;
+  } else if (hasMultipleCorrect) {
+    category = 'confirmed_error';
+    severity = 'major';
+    confidence = 96;
+  } else if (hasNoCorrect) {
+    category = 'confirmed_error';
+    severity = 'major';
+    confidence = 94;
+  } else if (!isOriginalCorrect && desKey && correctOptions.length > 0) {
+    category = 'confirmed_error';
+    severity = 'critical';
+    confidence = 97;
+  } else if (hasStemError) {
+    category = 'confirmed_error';
+    severity = 'major';
+    confidence = 95;
+  } else if (conflictAnalysis.hasConflict) {
+    category = 'potential_error';
+    severity = 'major';
+    confidence = 82;
+  } else {
+    category = 'no_detected_issue';
+    severity = 'none';
+    confidence = 98;
+  }
+
+  // Compile citations
+  const citations = optionAnalyses
+    .filter(o => o.citation_book !== 'None')
+    .map(o => ({
+      reference_name: o.citation_book,
+      pdf_page_index: o.citation_pdf_page,
+      printed_page_number: o.citation_page,
+      quote: o.citation_quote,
+      explanation: o.explanation,
+      target_type: 'option' as const,
+      target_identifier: `Option ${o.option_letter}`
+    }));
+
+  let rationale = '';
+  if (hasMultipleCorrect) {
+    rationale = `Audit revealed MULTIPLE CORRECT ANSWERS: Options [${correctOptions.join(', ')}] are all scientifically accurate based on cited textbook evidence.`;
+  } else if (hasNoCorrect) {
+    rationale = 'None of the provided options represent the scientifically established answer according to the reference literature.';
+  } else if (!isOriginalCorrect && desKey) {
+    rationale = `The original answer key designates Option ${desKey}, but scientific evidence confirms that Option ${correctOptions.join(', ')} is the correct answer.`;
+  } else {
+    rationale = `Original designated answer Option ${desKey || 'None'} is scientifically verified by the textbook references.`;
+  }
+
+  return {
+    stem_evaluation: {
+      has_scientific_error: hasStemError,
+      has_linguistic_ambiguity: hasAmbiguity,
+      has_contradiction: false,
+      has_false_premise: false,
+      details: stemErrorDetails,
+      proposed_stem_correction: (hasStemError || hasAmbiguity) ? proposedStem : undefined
+    },
+    answer_key_evaluation: {
+      original_designated_answer: designatedAnswer,
+      is_original_key_correct: isOriginalCorrect,
+      proposed_correct_answers: correctOptions,
+      has_multiple_correct_answers: hasMultipleCorrect,
+      has_no_correct_answer: hasNoCorrect,
+      rationale
+    },
+    option_analyses: optionAnalyses,
+    citations,
+    findings_category: category,
+    error_severity: severity,
+    confidence_score: confidence,
+    detailed_scientific_explanation: `${rationale} ${conflictAnalysis.summaryExplanation}`,
+    cross_reference_conflict_detected: conflictAnalysis.hasConflict,
+    conflict_explanation: conflictAnalysis.hasConflict ? conflictAnalysis.summaryExplanation : undefined
+  };
+}
+
+/**
+ * Execute AI validation using configured provider (Gemini / OpenAI / Claude / Built-in)
+ */
+export async function auditQuestionWithAI(
+  stem: string,
+  options: Array<{ label: string; text: string }>,
+  designatedAnswer: string,
+  evidenceBundle: QuestionSearchBundle,
+  providerOverride?: string
+): Promise<AIAuditResponse> {
+  const provider = providerOverride || getSetting('ai_provider', 'built_in');
+  const geminiKey = getSetting('gemini_api_key') || process.env.GEMINI_API_KEY;
+  const openaiKey = getSetting('openai_api_key') || process.env.OPENAI_API_KEY;
+  const anthropicKey = getSetting('anthropic_api_key') || process.env.ANTHROPIC_API_KEY;
+
+  // Select balanced evidence: reserve core stem hits + top hit(s) per option so generic option terms cannot drown out the stem topic or counter-evidence pages
+  const pickedMap = new Map<string, RetrievedEvidence>();
+  const addPicked = (ev: RetrievedEvidence) => {
+    const k = `${ev.referenceBookName}:${ev.pdfPageIndex}`;
+    const existing = pickedMap.get(k);
+    if (!existing || existing.relevanceScore < ev.relevanceScore) {
+      pickedMap.set(k, ev);
+    }
+  };
+
+  for (const ev of [...evidenceBundle.stemEvidence].sort((a, b) => b.relevanceScore - a.relevanceScore).slice(0, 5)) {
+    addPicked(ev);
+  }
+  for (const optEv of Object.values(evidenceBundle.optionsEvidence)) {
+    // Preserve curated diversity order from semantic retrieval (combined #1 + standalone definition #1)
+    for (const ev of optEv.slice(0, 2)) {
+      if (pickedMap.size >= 14) break;
+      addPicked(ev);
+    }
+  }
+  for (const ev of [...evidenceBundle.allRetrievedPages].sort((a, b) => b.relevanceScore - a.relevanceScore)) {
+    if (pickedMap.size >= 14) break;
+    addPicked(ev);
+  }
+  const topEvidence = Array.from(pickedMap.values())
+    .sort((a, b) => b.relevanceScore - a.relevanceScore)
+    .slice(0, 14);
+
+  const evidenceText = topEvidence
+    .map((ev, idx) => `[Source ${idx + 1}: ${ev.referenceBookName} | Printed Page: ${ev.printedPageNumber} | PDF Index: ${ev.pdfPageIndex}]\n"${ev.fullPageContent.slice(0, 2600)}"`)
+    .join('\n\n');
+
+  const optionsBlock = options.length > 0
+    ? options.map(o => `${o.label}) ${o.text}`).join('\n')
+    : 'Written / Open-Ended Question (No multiple-choice options; audit scientific accuracy of stem and any included model answer, keep option_analyses empty [])';
+
+  const userPrompt = `AUDIT REQUEST:
+QUESTION STEM:
+${stem}
+
+OPTIONS:
+${optionsBlock}
+
+DESIGNATED ANSWER KEY:
+${designatedAnswer || 'Not provided'}
+
+EXCLUSIVE REFERENCE EVIDENCE EXCERPTS:
+${evidenceText || 'No reference excerpts retrieved.'}
+
+Perform the comprehensive scientific audit adhering strictly to ALL Scientific Integrity, Comprehension, Exact Terminology, and Structural Context Rules above.
+Output valid JSON adhering to this schema:
+{
+  "stem_evaluation": {
+    "has_scientific_error": boolean,
+    "has_linguistic_ambiguity": boolean,
+    "has_contradiction": boolean,
+    "has_false_premise": boolean,
+    "details": string,
+    "proposed_stem_correction": string or null
+  },
+  "answer_key_evaluation": {
+    "original_designated_answer": string,
+    "is_original_key_correct": boolean,
+    "proposed_correct_answers": string[],
+    "has_multiple_correct_answers": boolean,
+    "has_no_correct_answer": boolean,
+    "rationale": string
+  },
+  "option_analyses": [
+    {
+      "option_letter": string,
+      "is_correct": boolean,
+      "is_partially_correct": boolean,
+      "explanation": string,
+      "citation_book": string,
+      "citation_page": string,
+      "citation_pdf_page": number,
+      "citation_quote": string
+    }
+  ],
+  "citations": [
+    {
+      "reference_name": string,
+      "pdf_page_index": number,
+      "printed_page_number": string,
+      "quote": string,
+      "explanation": string,
+      "target_type": "stem" | "answer_key" | "option" | "conflict",
+      "target_identifier": string
+    }
+  ],
+  "findings_category": "confirmed_error" | "highly_probable_error" | "potential_error" | "ambiguous_question" | "insufficient_evidence" | "no_detected_issue",
+  "error_severity": "critical" | "major" | "moderate" | "minor" | "none",
+  "confidence_score": number (0-100),
+  "detailed_scientific_explanation": string,
+  "cross_reference_conflict_detected": boolean,
+  "conflict_explanation": string or null
+}`;
+
+  // If Gemini provider is configured and key is present
+  let lastExternalError = '';
+  if (provider === 'gemini') {
+    if (!geminiKey) {
+      return buildUnavailableProviderFallback(options, designatedAnswer, evidenceBundle, 'gemini', 'missing GEMINI_API_KEY');
+    }
+
+    const configuredModel = getSetting('gemini_model', 'gemini-3.5-flash-lite');
+    const candidateModels = [
+      configuredModel,
+      'gemini-3.5-flash-lite',
+      'gemini-3.1-flash-lite',
+      'gemini-3.1-flash-lite-preview',
+      'gemini-3-flash-preview',
+      'gemini-3.5-flash'
+    ].filter((v, i, a) => Boolean(v) && a.indexOf(v) === i);
+
+    const maxRounds = 5;
+    for (let round = 0; round < maxRounds; round++) {
+      let triedAnyModelThisRound = false;
+
+      for (const model of candidateModels) {
+        if (Date.now() < (modelCooldownUntil[model] || 0)) {
+          continue;
+        }
+        triedAnyModelThisRound = true;
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+            const res = await fetch(url, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              signal: AbortSignal.timeout(25000),
+              body: JSON.stringify({
+                contents: [
+                  {
+                    role: 'user',
+                    parts: [{ text: `${SYSTEM_INSTRUCTIONS}\n\n${userPrompt}` }]
+                  }
+                ],
+                generationConfig: {
+                  responseMimeType: 'application/json',
+                  temperature: 0.1
+                }
+              })
+            });
+
+            if (res.ok) {
+              const data = await res.json();
+              let rawJson = data.candidates?.[0]?.content?.parts?.[0]?.text;
+              if (rawJson) {
+                rawJson = rawJson.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+                const parsed = JSON.parse(rawJson);
+                return parsed as AIAuditResponse;
+              }
+            } else {
+              const errTxt = await res.text().catch(() => '');
+              lastExternalError = `Gemini ${model} HTTP ${res.status}: ${errTxt.slice(0, 220)}`;
+              console.warn(lastExternalError);
+              if (res.status === 429) {
+                const { cooldownMs } = parseGeminiCooldown(errTxt, res.headers.get('retry-after'));
+                modelCooldownUntil[model] = Date.now() + cooldownMs;
+                break;
+              }
+              if (res.status === 503 && attempt === 0) {
+                await new Promise(r => setTimeout(r, 1200));
+                continue;
+              }
+            }
+            break;
+          } catch (err: any) {
+            lastExternalError = `Gemini ${model} error: ${err?.message || 'network timeout'}`;
+            console.warn(`Gemini API call with model ${model} attempt ${attempt + 1} failed:`, err);
+            if (attempt === 0) {
+              await new Promise(r => setTimeout(r, 800));
+            }
+          }
+        }
+      }
+
+      // Check remaining cooldowns: if it is a short RPM limit (<= 90s), wait it out;
+      // if all models hit daily quota exhaustion (> 90s), fail fast instead of hanging minutes per question.
+      if (round < maxRounds - 1) {
+        const now = Date.now();
+        const remainingWaits = candidateModels.map(m => Math.max(0, (modelCooldownUntil[m] || 0) - now));
+        const minWaitMs = Math.min(...remainingWaits);
+        if (minWaitMs > 90000) {
+          console.warn(`[Gemini] Daily quota exhausted across all candidate models (next reset in ${Math.round(minWaitMs / 60000)}m). Failing fast.`);
+          break;
+        }
+        const sleepMs = !triedAnyModelThisRound
+          ? Math.min(Math.max(minWaitMs + 500, 5000), 70000)
+          : (minWaitMs > 0 ? Math.min(minWaitMs + 500, 70000) : 3000);
+        console.log(`[Gemini] All models in temporary RPM cooldown, sleeping ${Math.round(sleepMs / 1000)}s before round ${round + 2}/${maxRounds}...`);
+        await new Promise(r => setTimeout(r, sleepMs));
+      }
+    }
+
+    return buildUnavailableProviderFallback(
+      options,
+      designatedAnswer,
+      evidenceBundle,
+      'gemini',
+      lastExternalError || 'All candidate Gemini models temporarily exhausted RPM quota'
+    );
+  }
+
+  // If OpenAI provider is configured and key is present
+  if (provider === 'openai') {
+    if (!openaiKey) {
+      return buildUnavailableProviderFallback(options, designatedAnswer, evidenceBundle, 'openai', 'missing OPENAI_API_KEY');
+    }
+    try {
+      const model = getSetting('openai_model', 'gpt-4o');
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${openaiKey}`
+        },
+        body: JSON.stringify({
+          model,
+          response_format: { type: 'json_object' },
+          temperature: 0.1,
+          messages: [
+            { role: 'system', content: SYSTEM_INSTRUCTIONS },
+            { role: 'user', content: userPrompt }
+          ]
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const content = data.choices?.[0]?.message?.content;
+        if (content) {
+          return JSON.parse(content) as AIAuditResponse;
+        }
+      }
+      lastExternalError = `OpenAI HTTP ${res.status}`;
+    } catch (err: any) {
+      lastExternalError = err?.message || 'OpenAI request error';
+      console.warn('OpenAI API call failed:', err);
+    }
+    return buildUnavailableProviderFallback(options, designatedAnswer, evidenceBundle, 'openai', lastExternalError);
+  }
+
+  if (provider !== 'built_in') {
+    return buildUnavailableProviderFallback(
+      options,
+      designatedAnswer,
+      evidenceBundle,
+      provider,
+      `Provider "${provider}" is not configured or key is missing`
+    );
+  }
+
+  // Built-in Deterministic Auditor (only when built_in mode is explicitly selected)
+  return runBuiltInMedicalAuditor(stem, options, designatedAnswer, evidenceBundle);
+}

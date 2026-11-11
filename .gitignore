@@ -1,0 +1,25 @@
+# Dependencies & build outputs
+/node_modules/
+/.next/
+/out/
+/build/
+
+# Local SQLite database & user-uploaded medical textbooks/exams (NEVER push private files or API keys)
+/data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Environment & secrets
+.env
+.env*.local
+
+# Logs & caches
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
