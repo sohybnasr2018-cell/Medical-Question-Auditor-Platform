@@ -129,7 +129,10 @@ PART E — QUANTITATIVE, OCR LAYOUT & KEY DEFENSE GATES
 24. MISSING COVERAGE VS FALSE "NO CORRECT ANSWER":
     NEVER set has_no_correct_answer=true and findings_category="confirmed_error" when:
     - The textbook excerpts do not cover the question topic at all (use "insufficient_evidence" instead), OR
-    - One option aligns with the core medical truth / textbook mechanism while all other choices are clearly false, even if a secondary qualifier in that option is absent from a brief lecture bullet (e.g. chemoreceptor firing during severe hypotension, hyperglycemia in atherosclerosis).`;
+    - One option aligns with the core medical truth / textbook mechanism while all other choices are clearly false, even if a secondary qualifier in that option is absent from a brief lecture bullet (e.g. chemoreceptor firing during severe hypotension, hyperglycemia in atherosclerosis).
+
+25. IDENTICAL OR EQUIVALENT DUPLICATE OPTIONS (MANDATORY MULTIPLE CORRECT):
+    Before finalizing "option_analyses", compare every MCQ option's text against all sibling options. Whenever two or more options have identical or verbatim-equivalent wording (for example Option C and Option D both state "Horizontal transmission"), you MUST assign ALL identical options the EXACT SAME "is_correct" verdict. NEVER mark one identical twin false merely because the other letter is listed in DESIGNATED ANSWER KEY. Whenever that shared wording is a winning answer (for either standard or INVERTED EXCEPT/NOT questions), mark ALL matching letters "is_correct": true, include ALL of them in "proposed_correct_answers" (e.g., ["C", "D"]), set "has_multiple_correct_answers": true, set "is_original_key_correct": false (unless DESIGNATED ANSWER KEY already listed all matching letters), and set "findings_category": "confirmed_error".`;
 
 function parseGeminiCooldown(errTxt: string, retryAfterHeader: string | null): { cooldownMs: number; isDailyExhausted: boolean } {
   const isDailyLimit = /per day limit exceeded|limit:\s*0\b/i.test(errTxt);
@@ -779,12 +782,13 @@ PERFORM THESE 5 MANDATORY CHECKS STRICTLY:
    - Example: Decreasing heart rate prolongs diastolic filling time -> increases EDV/preload ("Heart rate" is listed under preload determinants); conversely using "RAP decreases -> VR increases" to claim decreased RAP increases preload ignores another excerpt saying "increased RAP increases EDV/COP" and "RAP is main force for ventricular filling".
    - Example: Increased venous compliance decreases MSFP (reducing filling pressure & venous return -> decreases diastolic filling rate) directly, whereas sympathetic stimulation increases MSFP/CO unless HR > 220.
    - Example: Preposition or terminology phrasing differences ("at the inguinal ligament" vs "behind the inguinal ligament", "tension-length curve" vs "Starling curve", or a missing minor risk factor alongside a true textbook factor when the other 3 options are clearly false) are NOT grounds to fail a valid designated key!
-   - If the designated key IS scientifically valid/defensible OR Pass 1's challenge relies on multi-hop deductions, OCR table conflation, wrong numbers/qualifiers, or pedantry -> OVERTURN Pass 1 and return is_original_key_correct=true, proposed_correct_answers=["${designatedAnswer || ''}"], findings_category="no_detected_issue", error_severity="none" (unless designatedAnswer is "Not provided").
-   - ONLY UPHOLD findings_category="confirmed_error" if the designated key is truly indefensible against explicit evidence (e.g., naming Staph aureus for subacute endocarditis when excerpts specify Strep viridans/weak bacteria vs Staph aureus for acute endocarditis), OR two options are indisputably correct under the EXACT SAME clinical scope and textbook heading.
+   - If the designated key IS scientifically valid/defensible AND only one option is truly valid (and Pass 1's challenge relies on multi-hop deductions, OCR table conflation, wrong numbers/qualifiers, or pedantry) -> OVERTURN Pass 1 and return is_original_key_correct=true, proposed_correct_answers=["${designatedAnswer || ''}"], findings_category="no_detected_issue", error_severity="none" (unless designatedAnswer is "Not provided").
+   - ONLY UPHOLD findings_category="confirmed_error" if the designated key is truly indefensible against explicit evidence (e.g., naming Staph aureus for subacute endocarditis when excerpts specify Strep viridans/weak bacteria vs Staph aureus for acute endocarditis), OR two or more options are indisputably correct under the EXACT SAME clinical scope (including IDENTICAL/EQUIVALENT duplicate options such as C === D).
 
 4. "NO CORRECT ANSWER" & "MULTIPLE CORRECT" AUDIT:
    - Never uphold has_no_correct_answer=true when excerpts simply don't cover the topic (use "insufficient_evidence"), nor when the designated key reflects standard textbook science despite brief bullet wording.
    - Never uphold has_multiple_correct_answers=true for a secondary option that differs in terminology suffix (stenosis vs incompetence), wrong category/stage, acute rescue vs ongoing prophylaxis when distinction applies, or a textbook shorthand erratum contradicted elsewhere (Rule 20).
+   - ALWAYS uphold has_multiple_correct_answers=true and findings_category="confirmed_error" if two or more options have identical/verbatim-equivalent winning text (e.g. Option C and Option D both state the same winning answer), NEVER mark one twin false merely to agree with a single-letter designated key.
 
 5. OUTPUT COMPLETE CORRECTED JSON adhering strictly to this schema (preserving verified citations cleanly):
 ${AUDIT_RESPONSE_JSON_SCHEMA}`;
@@ -1014,6 +1018,8 @@ ${AUDIT_RESPONSE_JSON_SCHEMA}`;
 
 export interface VisionExtractedQuestion {
   originalNumber: number;
+  pageNumber?: number; // original document 1-based PDF page index
+  chunkPageIndex?: number; // 1-based page index inside sliced PDF chunk
   stem: string;
   options: Array<{ label: string; text: string }>;
   designatedAnswer: string;
@@ -1023,7 +1029,7 @@ export interface VisionExtractedQuestion {
 
 export interface VisionExamPageResult {
   questions: VisionExtractedQuestion[];
-  answerKeyMappings: Array<{ questionNumber: number; answer: string }>;
+  answerKeyMappings: Array<{ questionNumber: number; answer: string; pageNumber?: number; chunkPageIndex?: number }>;
   rawTranscribedText: string;
 }
 
@@ -1039,10 +1045,51 @@ function getGeminiVisionModels(): string[] {
   ].filter((v, i, a) => Boolean(v) && a.indexOf(v) === i);
 }
 
+function buildVisionExamPrompt(pageLabel: string, extraPageMappingInstruction: string): string {
+  return `You are a high-precision medical exam digitizer inspecting ${pageLabel}.
+Extract EVERY question visible verbatim and accurately in reading order (top-to-bottom; reconstruct any 2-column options into A, B, C, D, E order).
+
+CRITICAL ACCURACY RULES:
+1. Read EVERY colored-circle / boxed / margin-collided question number accurately (e.g., 1, 2, ... 98, 99, 100...).
+2. Preserve EVERY medical symbol, unit, fraction, subscript, and percentage accurately (e.g., t1/2 = 4 hours, 75%, 100%, mg/mL, ng/mL, pKa, <, >) — do NOT drop or misread digits.
+3. For two-column option grids (e.g., "a. ...   c. ..." on row 1, "b. ...   d. ..." on row 2), assign option labels A, B, C, D cleanly by their printed letter.
+4. VISUAL & TEXT ANSWER KEY DETECTION (CRITICAL — CHECK EVERY METHOD):
+   Inspect ALL possible ways designated answer keys may appear:
+   - Footer/margin/table answer strips (e.g. "10 C 11 C ... 16 A,C", "98 b  99 a", "Answer: B")
+   - Highlighted background boxes (yellow/green/blue shading behind one option)
+   - Distinct colored font on the correct option (e.g. green, red, or blue option text vs black distractors)
+   - Uniquely bolded or underlined correct option vs regular distractors
+   - Circled option letter, checkmark (✓ / ✔ / * / ☑), or handwritten tick
+   Attach "designatedAnswer" (comma-separated like "A, C" if multiple letters are indicated, "" if genuinely no answer mark exists on the page) onto matching questions AND list every mapping in "answerKeyMappings".
+5. VISUAL FIGURE DETECTION (CRITICAL):
+   - Set "usesVisualFigure": true ONLY if the question refers to or depends on an actual picture, graph, curve plot, diagram, blood film, histology slide, spotter photo, X-ray, ECG, pedigree, chart, or specimen photo visible on the page (FALSE for text-only MCQs or decorative page borders!).
+   - Whenever "usesVisualFigure" is true, provide a precise, factual "visualDescription" describing EVERY visual element needed to solve it (axes labels, exact curve positions/shifts/Emax plateaus, visible parasite/cell structures, stain, spine/arrow position, diagnosis-defining features). Do NOT guess or fabricate the final answer key in visualDescription.
+6. If a page contains only an answer key table with no questions, set "questions": [] and populate "answerKeyMappings".${extraPageMappingInstruction}
+7. Output valid JSON strictly adhering to:
+{
+  "questions": [
+    {
+      "originalNumber": number,
+      "chunkPageIndex": number (1-based page within this input),
+      "pageNumber": number (original document 1-based page number),
+      "stem": string,
+      "options": [{ "label": "A" | "B" | "C" | "D" | "E", "text": string }],
+      "designatedAnswer": string (e.g. "B", "A, C", or "" if not shown),
+      "usesVisualFigure": boolean,
+      "visualDescription": string ("" if usesVisualFigure is false)
+    }
+  ],
+  "answerKeyMappings": [
+    { "questionNumber": number, "answer": string, "chunkPageIndex": number, "pageNumber": number }
+  ],
+  "rawTranscribedText": string
+}`;
+}
+
 /**
  * Use multimodal Gemini Vision on an image-backed exam page (PNG/JPG/WEBP) to transcribe every
  * question, multi-column option list, badge number, numeric symbol (e.g. t1/2, %), answer-key
- * box, AND objective visual descriptions of any accompanying figure/graph/slide.
+ * box/highlight, AND objective visual descriptions of any accompanying figure/graph/slide.
  */
 export async function extractExamPageWithGeminiVision(
   imageBuffer: Buffer,
@@ -1055,35 +1102,10 @@ export async function extractExamPageWithGeminiVision(
     return null;
   }
 
-  const prompt = `You are a high-precision medical exam digitizer inspecting Page ${pageNumber} of a medical examination sheet.
-Extract EVERY question visible on this page verbatim and accurately in reading order (top-to-bottom; reconstruct any 2-column options into A, B, C, D, E order).
-
-CRITICAL ACCURACY RULES:
-1. Read EVERY colored-circle / boxed question number accurately (e.g., 98, 99, 100, 101...).
-2. Preserve EVERY medical symbol, unit, fraction, subscript, and percentage accurately (e.g., t1/2 = 4 hours, 75%, 100%, mg/mL, ng/mL, pKa, <, >) — do NOT drop or misread digits.
-3. For two-column option grids (e.g., "a. ...   c. ..." on row 1, "b. ...   d. ..." on row 2), assign option labels A, B, C, D cleanly by their printed letter.
-4. Read ANY answer key strip / green answer boxes / matrix at the bottom, margin, or end of the page (e.g., "98 b  99 a  100 d ...") and both attach "designatedAnswer" onto matching questions AND list every pair in "answerKeyMappings".
-5. VISUAL FIGURE DETECTION (CRITICAL):
-   - Set "usesVisualFigure": true ONLY if the question refers to or depends on an actual picture, graph, curve plot, diagram, blood film, histology slide, X-ray, ECG, or specimen photo visible on the page (FALSE for text-only MCQs!).
-   - Whenever "usesVisualFigure" is true, provide a precise, factual "visualDescription" describing EVERY visual element needed to solve it (axes labels, exact curve positions/shifts/Emax plateaus for each labeled curve like P, Q, R, S, T vs X, visible parasite/cell structures, stain, spine position, etc.). Do NOT guess or fabricate the final answer key in visualDescription.
-6. If a page contains only an answer key table with no questions, set "questions": [] and populate "answerKeyMappings".
-7. Output valid JSON strictly adhering to:
-{
-  "questions": [
-    {
-      "originalNumber": number,
-      "stem": string,
-      "options": [{ "label": "A" | "B" | "C" | "D" | "E", "text": string }],
-      "designatedAnswer": string (e.g. "B" or "" if not shown),
-      "usesVisualFigure": boolean,
-      "visualDescription": string ("" if usesVisualFigure is false)
-    }
-  ],
-  "answerKeyMappings": [
-    { "questionNumber": number, "answer": "A" | "B" | "C" | "D" | "E" }
-  ],
-  "rawTranscribedText": string
-}`;
+  const prompt = buildVisionExamPrompt(
+    `Page ${pageNumber} of a medical examination sheet`,
+    `\n- Set "chunkPageIndex": 1 and "pageNumber": ${pageNumber} on all extracted questions and answerKeyMappings.`
+  );
 
   const parts = [
     { text: prompt },
@@ -1108,6 +1130,81 @@ CRITICAL ACCURACY RULES:
   }
 
   return parsed;
+}
+
+/**
+ * Use native Gemini multimodal PDF understanding on a sliced 1..4 page PDF buffer.
+ * Reads vector text, colored highlights, circled choices, bold fonts, answer tables,
+ * raster slides, and vector graphs with full native layout fidelity.
+ */
+export async function extractExamPdfChunkWithGeminiVision(
+  pdfChunkBuffer: Buffer,
+  originalPageNumbers: number[]
+): Promise<VisionExamPageResult | null> {
+  const provider = getSetting('ai_provider', 'built_in');
+  const geminiKey = getSetting('gemini_api_key') || process.env.GEMINI_API_KEY;
+  if (
+    provider !== 'gemini' ||
+    !geminiKey ||
+    !pdfChunkBuffer ||
+    pdfChunkBuffer.length === 0 ||
+    originalPageNumbers.length === 0
+  ) {
+    return null;
+  }
+
+  const mappingLines = originalPageNumbers
+    .map((orig, idx) => `Chunk Page ${idx + 1} = Original Document Page ${orig}`)
+    .join('; ');
+
+  const prompt = buildVisionExamPrompt(
+    `this ${originalPageNumbers.length}-page examination PDF slice`,
+    `\n- PAGE INDEX MAPPING: ${mappingLines}. Set BOTH "chunkPageIndex" (1..${originalPageNumbers.length}) and "pageNumber" (the matching Original Document Page number) accurately on every item.`
+  );
+
+  const { parsed } = await callGeminiWithCandidates<VisionExamPageResult>(
+    [
+      { text: prompt },
+      {
+        inline_data: {
+          mime_type: 'application/pdf',
+          data: pdfChunkBuffer.toString('base64')
+        }
+      }
+    ],
+    getGeminiVisionModels(),
+    geminiKey,
+    65000,
+    0.0
+  );
+
+  if (!parsed || (!Array.isArray(parsed.questions) && !Array.isArray(parsed.answerKeyMappings))) {
+    return null;
+  }
+
+  const resolvePage = (item: { pageNumber?: number; chunkPageIndex?: number }): number => {
+    const cIdx = Number(item?.chunkPageIndex);
+    if (Number.isFinite(cIdx) && cIdx >= 1 && cIdx <= originalPageNumbers.length) {
+      return originalPageNumbers[cIdx - 1];
+    }
+    const pNum = Number(item?.pageNumber);
+    if (Number.isFinite(pNum) && originalPageNumbers.includes(pNum)) {
+      return pNum;
+    }
+    return originalPageNumbers[0];
+  };
+
+  return {
+    questions: (parsed.questions || []).map(q => ({
+      ...q,
+      pageNumber: resolvePage(q)
+    })),
+    answerKeyMappings: (parsed.answerKeyMappings || []).map(m => ({
+      ...m,
+      pageNumber: resolvePage(m)
+    })),
+    rawTranscribedText: String(parsed.rawTranscribedText || '')
+  };
 }
 
 /**

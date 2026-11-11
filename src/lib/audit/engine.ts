@@ -1,7 +1,7 @@
 import { getDb, PAGES_DIR } from '@/lib/db';
 import { classifyQuestionSubject } from './classifier';
 import { retrieveQuestionEvidence } from '@/lib/search/semantic';
-import { auditQuestionWithAI, QuestionMediaInput } from '@/lib/ai/provider';
+import { auditQuestionWithAI, describeQuestionImageWithVision, QuestionMediaInput } from '@/lib/ai/provider';
 import { AIAuditResponse } from '@/lib/ai/schemas';
 import { isInvertedPolarityQuestion } from './question-polarity';
 import crypto from 'node:crypto';
@@ -29,14 +29,15 @@ const VALID_SEVERITIES = new Set(['critical', 'major', 'moderate', 'minor', 'non
 const VALID_TARGET_TYPES = new Set(['stem', 'answer_key', 'option', 'conflict']);
 
 /**
- * Normalize external LLM response so missing/inconsistent fields or inverted-polarity
- * boolean flips cannot corrupt SQLite records or report false errors.
+ * Normalize external LLM response so missing/inconsistent fields, inverted-polarity
+ * boolean flips, or identical duplicate options cannot corrupt SQLite records or hide errors.
  */
 export function sanitizeAiResponse(
   raw: AIAuditResponse,
   designatedAnswer: string,
   stem: string = '',
-  hasMcqOptions: boolean = true
+  hasMcqOptions: boolean = true,
+  options?: Array<{ label: string; text: string }>
 ): AIAuditResponse {
   const category = VALID_CATEGORIES.has(raw?.findings_category)
     ? raw.findings_category
@@ -132,6 +133,7 @@ export function sanitizeAiResponse(
   }
 
   // 3. Cross-check option_analyses vs proposed_correct_answers to eliminate contradictions
+  let duplicateCorrectNote = '';
   if (optionAnalyses.length > 0 && finalCategory !== 'insufficient_evidence') {
     const validOptionSet = new Set(optionAnalyses.filter(o => o.is_correct).map(o => o.option_letter.toUpperCase()));
     if (validOptionSet.size > 0 && proposedAnswers.length > 0) {
@@ -143,6 +145,59 @@ export function sanitizeAiResponse(
       }
     } else if (validOptionSet.size > 0 && proposedAnswers.length === 0) {
       proposedAnswers = Array.from(validOptionSet);
+    }
+
+    // 3b. Deterministic Duplicate / Identical Option Guard:
+    // Whenever 2+ MCQ options have identical normalized wording and at least one is correct/proposed,
+    // ALL identical twins MUST be marked is_correct=true and included in proposed_correct_answers.
+    let hasDuplicateCorrectDefect = false;
+    if (hasMcqOptions && Array.isArray(options) && options.length >= 2) {
+      const normOpt = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      const textGroups = new Map<string, string[]>();
+      for (const opt of options) {
+        const key = normOpt(opt.text || '');
+        if (key.length < 2) continue;
+        const lbl = opt.label.trim().toUpperCase();
+        const arr = textGroups.get(key) || [];
+        if (!arr.includes(lbl)) arr.push(lbl);
+        textGroups.set(key, arr);
+      }
+
+      const dupNotes: string[] = [];
+      for (const [, labels] of textGroups.entries()) {
+        if (labels.length < 2) continue;
+        const propSet = new Set(proposedAnswers.map(a => a.trim().toUpperCase()));
+        const isWinningGroup = labels.some(
+          lbl => propSet.has(lbl) || optionAnalyses.some(o => o.option_letter.toUpperCase() === lbl && o.is_correct)
+        );
+        if (!isWinningGroup) continue;
+
+        hasDuplicateCorrectDefect = true;
+        const primaryWinner = labels.find(lbl => propSet.has(lbl)) || labels[0];
+        for (const lbl of labels) {
+          if (!propSet.has(lbl)) {
+            proposedAnswers.push(lbl);
+            propSet.add(lbl);
+          }
+          optionAnalyses = optionAnalyses.map((o) => {
+            if (o.option_letter.toUpperCase() !== lbl) return o;
+            const cleanedExp = o.explanation
+              .replace(/^\[True statement - NOT the exception\]:\s*/i, '')
+              .trim();
+            const prefix = isInverted ? '[CORRECT EXCEPTION - IDENTICAL OPTION]' : '[CORRECT - IDENTICAL OPTION]';
+            const updatedExp = lbl === primaryWinner
+              ? o.explanation
+              : `${prefix}: Identical text to Option ${primaryWinner}; also a valid answer (${cleanedExp}).`;
+            return { ...o, is_correct: true, explanation: updatedExp };
+          });
+        }
+        dupNotes.push(`Options ${labels.join(' & ')} have identical text`);
+      }
+
+      if (dupNotes.length > 0) {
+        proposedAnswers = Array.from(new Set(proposedAnswers.map(a => a.trim().toUpperCase()))).sort();
+        duplicateCorrectNote = ` Duplicate-option defect detected: ${dupNotes.join('; ')}, producing multiple correct answers (${proposedAnswers.join(', ')}).`;
+      }
     }
 
     hasMulti = proposedAnswers.length > 1;
@@ -162,6 +217,22 @@ export function sanitizeAiResponse(
       !hasMulti;
 
     if (
+      (hasDuplicateCorrectDefect ||
+        (hasMulti &&
+          !matchesDesignatedKeySet &&
+          !hasNoCorrect &&
+          finalCategory !== 'ambiguous_question' &&
+          !stemEval.has_linguistic_ambiguity)) &&
+      (!hasValidDesignatedKey || !matchesDesignatedKeySet)
+    ) {
+      if (hasValidDesignatedKey && !matchesDesignatedKeySet) {
+        isOrigCorrect = false;
+      }
+      finalCategory = 'confirmed_error';
+      if (finalSeverity === 'none' || finalSeverity === 'minor' || finalSeverity === 'moderate') {
+        finalSeverity = 'major';
+      }
+    } else if (
       hasValidDesignatedKey &&
       (matchesDesignatedKeySet || matchesSingleKey) &&
       !hasNoCorrect &&
@@ -199,7 +270,7 @@ export function sanitizeAiResponse(
       proposed_correct_answers: proposedAnswers,
       has_multiple_correct_answers: hasMulti,
       has_no_correct_answer: hasNoCorrect,
-      rationale: String(ansEval.rationale || raw?.detailed_scientific_explanation || 'Evaluated using reference excerpts.')
+      rationale: `${String(ansEval.rationale || raw?.detailed_scientific_explanation || 'Evaluated using reference excerpts.')}${duplicateCorrectNote}`
     },
     option_analyses: optionAnalyses,
     citations: citationsList.map((c: any) => ({
@@ -351,6 +422,7 @@ export async function executeAuditSession(
         }
 
         let questionMedia: QuestionMediaInput | undefined;
+        let lazyImageDescription: string | null = null;
         if (q.image_path || q.image_description) {
           let imageBuffer: Buffer | undefined;
           let mimeType = 'image/png';
@@ -361,19 +433,28 @@ export async function executeAuditSession(
               const lower = safePath.toLowerCase();
               if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) mimeType = 'image/jpeg';
               else if (lower.endsWith('.webp')) mimeType = 'image/webp';
+              else if (lower.endsWith('.pdf')) mimeType = 'application/pdf';
             }
           }
-          if (imageBuffer || q.image_description) {
+          let activeDesc = q.image_description || '';
+          if (!activeDesc && imageBuffer && providerMode === 'gemini') {
+            const generatedDesc = await describeQuestionImageWithVision(imageBuffer, q.stem, options, mimeType);
+            if (generatedDesc) {
+              activeDesc = generatedDesc;
+              lazyImageDescription = generatedDesc;
+            }
+          }
+          if (imageBuffer || activeDesc) {
             questionMedia = {
               imageBuffer,
               mimeType,
-              imageDescription: q.image_description || undefined
+              imageDescription: activeDesc || undefined
             };
           }
         }
 
-        const retrievalStem = q.image_description
-          ? `${q.stem} ${q.image_description}`
+        const retrievalStem = questionMedia?.imageDescription
+          ? `${q.stem} ${questionMedia.imageDescription}`
           : q.stem;
 
         const classification = await classifyQuestionSubject(retrievalStem, options, allReadyBooks);
@@ -392,14 +473,17 @@ export async function executeAuditSession(
           providerMode,
           questionMedia
         );
-        const aiResult = sanitizeAiResponse(rawAiResult, q.designated_answer || '', q.stem, options.length > 0);
+        const aiResult = sanitizeAiResponse(rawAiResult, q.designated_answer || '', q.stem, options.length > 0, options);
 
-        return { q, options, classification, aiResult };
+        return { q, options, classification, aiResult, lazyImageDescription };
       })
     );
 
     // Persist batch results synchronously in order (safe for node:sqlite)
-    for (const { q, options, classification, aiResult } of evaluatedBatch) {
+    for (const { q, options, classification, aiResult, lazyImageDescription } of evaluatedBatch) {
+      if (lazyImageDescription) {
+        db.prepare('UPDATE questions SET image_description = ? WHERE id = ?').run(lazyImageDescription, q.id);
+      }
       updateQuestionClassification.run(
         classification.primarySubject,
         JSON.stringify(classification.secondarySubjects),

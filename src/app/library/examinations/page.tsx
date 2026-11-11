@@ -142,6 +142,25 @@ export default function ExaminationLibraryPage() {
     }
   };
 
+  const handleUpdateQuestionKey = async (questionId: string, nextAnswer: string) => {
+    try {
+      const res = await fetch('/api/examinations', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ questionId, designatedAnswer: nextAnswer })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPreviewQuestions(prev =>
+          prev.map(pq => (pq.id === questionId ? { ...pq, designated_answer: data.designatedAnswer } : pq))
+        );
+        fetchExaminations();
+      }
+    } catch (err) {
+      console.error('Failed to update answer key:', err);
+    }
+  };
+
   return (
     <div className="max-w-7xl mx-auto space-y-6">
       {/* Header */}
@@ -213,7 +232,27 @@ export default function ExaminationLibraryPage() {
                     )}
                   </td>
                   <td className="px-4 py-4 text-slate-700 font-medium">
-                    {exam.question_count} Questions
+                    <div>{exam.question_count} Questions</div>
+                    <div className="flex flex-wrap gap-1.5 mt-1">
+                      {exam.mcq_count > 0 && (
+                        <span
+                          className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
+                            exam.keyed_count >= exam.mcq_count
+                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                              : exam.keyed_count > 0
+                              ? 'bg-amber-50 text-amber-700 border-amber-200'
+                              : 'bg-slate-100 text-slate-600 border-slate-200'
+                          }`}
+                        >
+                          {exam.keyed_count}/{exam.mcq_count} Keys
+                        </span>
+                      )}
+                      {exam.image_count > 0 && (
+                        <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 border border-sky-200">
+                          {exam.image_count} Figure{exam.image_count > 1 ? 's' : ''}
+                        </span>
+                      )}
+                    </div>
                   </td>
                   <td className="px-4 py-4">
                     <Badge variant={exam.latest_session_status === 'completed' ? 'ready' : 'info'}>
@@ -363,13 +402,44 @@ export default function ExaminationLibraryPage() {
               let opts = [];
               try { opts = JSON.parse(q.options_json); } catch {}
 
-              return (
+              const handleUpdateQuestionKey = async (questionId: string, nextAnswer: string) => {
+    try {
+      const res = await fetch('/api/examinations', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ questionId, designatedAnswer: nextAnswer })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPreviewQuestions(prev =>
+          prev.map(pq => (pq.id === questionId ? { ...pq, designated_answer: data.designatedAnswer } : pq))
+        );
+        fetchExaminations();
+      }
+    } catch (err) {
+      console.error('Failed to update answer key:', err);
+    }
+  };
+
+  return (
                 <div key={q.id} className="p-4 border border-slate-200 rounded-lg bg-slate-50/50 space-y-2">
-                  <div className="flex items-center justify-between text-xs font-bold text-slate-700">
+                  <div className="flex items-center justify-between text-xs font-bold text-slate-700 gap-2">
                     <span>Question {q.question_number}</span>
-                    <span className="text-teal-700 bg-teal-50 px-2 py-0.5 rounded border border-teal-200">
-                      Designated Key: {q.designated_answer || 'None provided'}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-teal-700 bg-teal-50 px-2 py-0.5 rounded border border-teal-200">
+                        Designated Key: {q.designated_answer || 'None provided'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const next = prompt(`Enter answer key for Q${q.question_number} (e.g. A or A, C; leave blank to clear):`, q.designated_answer || '');
+                          if (next !== null) handleUpdateQuestionKey(q.id, next);
+                        }}
+                        className="text-[10px] font-semibold text-slate-600 hover:text-teal-700 bg-white px-2 py-0.5 rounded border border-slate-200"
+                      >
+                        Edit Key
+                      </button>
+                    </div>
                   </div>
                   <p className="text-sm text-slate-800">{q.stem}</p>
                   {q.image_path && (
@@ -377,12 +447,20 @@ export default function ExaminationLibraryPage() {
                       <div className="text-[11px] font-bold uppercase tracking-wider text-teal-700">
                         Attached Question Figure / Image
                       </div>
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img
-                        src={`/api/questions/${q.id}/image`}
-                        alt={`Question ${q.question_number} figure`}
-                        className="max-h-72 w-auto rounded border border-slate-100 object-contain"
-                      />
+                      {q.image_path.toLowerCase().endsWith('.pdf') ? (
+                        <iframe
+                          src={`/api/questions/${q.id}/image#toolbar=0&view=FitH`}
+                          title={`Question ${q.question_number} figure PDF`}
+                          className="w-full h-72 rounded border border-slate-100 bg-white"
+                        />
+                      ) : (
+                        /* eslint-disable-next-line @next/next/no-img-element */
+                        <img
+                          src={`/api/questions/${q.id}/image`}
+                          alt={`Question ${q.question_number} figure`}
+                          className="max-h-72 w-auto rounded border border-slate-100 object-contain"
+                        />
+                      )}
                       {q.image_description && (
                         <p className="text-[11px] text-slate-500 leading-relaxed">
                           <strong>Visual Analysis:</strong> {q.image_description}
@@ -391,18 +469,24 @@ export default function ExaminationLibraryPage() {
                     </div>
                   )}
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-2 text-xs">
-                    {opts.map((opt: any) => (
-                      <div
-                        key={opt.label}
-                        className={`p-2 rounded border ${
-                          q.designated_answer === opt.label
-                            ? 'bg-emerald-50 border-emerald-200 font-semibold text-emerald-900'
-                            : 'bg-white border-slate-200 text-slate-700'
-                        }`}
-                      >
-                        <strong>{opt.label})</strong> {opt.text}
-                      </div>
-                    ))}
+                    {opts.map((opt: any) => {
+                      const isDesignated = (q.designated_answer || '')
+                        .toUpperCase()
+                        .split(/[\s,]+/)
+                        .includes(String(opt.label).toUpperCase());
+                      return (
+                        <div
+                          key={opt.label}
+                          className={`p-2 rounded border ${
+                            isDesignated
+                              ? 'bg-emerald-50 border-emerald-200 font-semibold text-emerald-900'
+                              : 'bg-white border-slate-200 text-slate-700'
+                          }`}
+                        >
+                          <strong>{opt.label})</strong> {opt.text}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               );

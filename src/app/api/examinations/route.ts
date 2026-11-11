@@ -46,6 +46,9 @@ export async function GET(req: NextRequest) {
       SELECT 
         e.*,
         (SELECT COUNT(*) FROM questions WHERE examination_id = e.id) as question_count,
+        (SELECT COUNT(*) FROM questions WHERE examination_id = e.id AND json_array_length(options_json) >= 2) as mcq_count,
+        (SELECT COUNT(*) FROM questions WHERE examination_id = e.id AND COALESCE(TRIM(designated_answer), '') != '') as keyed_count,
+        (SELECT COUNT(*) FROM questions WHERE examination_id = e.id AND COALESCE(TRIM(image_path), '') != '') as image_count,
         (SELECT id FROM audit_sessions WHERE examination_id = e.id ORDER BY created_at DESC LIMIT 1) as latest_session_id,
         (SELECT status FROM audit_sessions WHERE examination_id = e.id ORDER BY created_at DESC LIMIT 1) as latest_session_status
       FROM examinations e
@@ -142,6 +145,37 @@ export async function POST(req: NextRequest) {
       attachedImagesCount,
       message: `Re-extracted ${parsedQuestions.length} questions (${attachedImagesCount} with images) from "${exam.title}".`
     });
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}
+
+export async function PATCH(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const questionId = String(body?.questionId || '').trim();
+    const rawAns = String(body?.designatedAnswer ?? '').trim().toUpperCase();
+    if (!questionId) {
+      return NextResponse.json({ error: 'questionId required' }, { status: 400 });
+    }
+
+    const letters = Array.from(
+      new Set(
+        rawAns
+          .split(/[,&\s]+/)
+          .map(s => s.trim())
+          .filter(s => /^[A-E]$/.test(s))
+      )
+    );
+    const normalized = letters.length > 0 ? letters.join(', ') : (rawAns ? rawAns : null);
+
+    const db = getDb();
+    const res = db.prepare('UPDATE questions SET designated_answer = ? WHERE id = ?').run(normalized, questionId);
+    if (res.changes === 0) {
+      return NextResponse.json({ error: 'Question not found' }, { status: 404 });
+    }
+
+    return NextResponse.json({ success: true, designatedAnswer: normalized || '' });
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
