@@ -56,29 +56,155 @@ function normalizeSectionKey(name: string): string {
     .trim();
 }
 
+interface FooterAnswerPair {
+  num: number;
+  ans: string;
+  used?: boolean;
+}
+
 /**
- * Parse horizontal paired answer strips (e.g. "98 b  99 a  100 d  101 d") commonly placed in page footers.
+ * Parse horizontal paired answer keys on a single line (e.g. "10 C 11 C ... 16 A,C 17 A" or "1 C").
+ * Single-pair lines are accepted only when allowSinglePair is true (bottom footer zone of a page).
  */
-function parseHorizontalAnswerPairs(text: string): Record<number, string> {
-  const map: Record<number, string> = {};
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.length > 220) continue;
-    const pairs = Array.from(line.matchAll(/\b(\d{1,3})\s*[\.\:\-\)]?\s*([a-eA-E])\b(?!\s*[a-zA-Z]{2,})/g));
-    // Require at least 3 key pairs on the same strip so normal prose (e.g. "4 hours") never triggers
-    if (pairs.length >= 3) {
-      const leftover = line.replace(/\b\d{1,3}\s*[\.\:\-\)]?\s*[a-eA-E]\b/g, '').replace(/[\s|,;:\-\[\]\(\)]+/g, '');
-      if (leftover.length <= 6) {
-        for (const p of pairs) {
-          const qNum = parseInt(p[1], 10);
-          if (qNum > 0 && qNum <= 500) {
-            map[qNum] = p[2].toUpperCase();
-          }
+function parseAnswerPairLine(line: string, allowSinglePair: boolean): FooterAnswerPair[] | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.length > 260) return null;
+  if (/\)\s+[a-zA-Z]{2,}/.test(trimmed)) return null;
+
+  const pairRegex = /\b(\d{1,3})\s*[\.\:\-\)]?\s*([a-eA-E](?:\s*,\s*[a-eA-E])*)\b(?!\s*[a-zA-Z]{2,})/g;
+  const matches = Array.from(trimmed.matchAll(pairRegex));
+  const minPairs = allowSinglePair ? 1 : 2;
+  if (matches.length < minPairs) return null;
+
+  const leftover = trimmed
+    .replace(pairRegex, '')
+    .replace(/[\s|,;:\-\[\]\(\)]+/g, '');
+  if (leftover.length > (allowSinglePair ? 0 : 4)) return null;
+
+  const out: FooterAnswerPair[] = [];
+  for (const m of matches) {
+    const qNum = parseInt(m[1], 10);
+    if (qNum <= 0 || qNum > 500) continue;
+    const ansClean = m[2]
+      .split(',')
+      .map(s => s.trim().toUpperCase())
+      .filter(Boolean)
+      .join(', ');
+    if (ansClean) {
+      out.push({ num: qNum, ans: ansClean });
+    }
+  }
+  return out.length >= minPairs ? out : null;
+}
+
+/**
+ * Normalize margin collisions & strip per-page chrome/footer answer strips cleanly on every page
+ * BEFORE assembling the document stream, preserving exact page-scoped footer keys so resetting
+ * section question numbers ("Part 1: 1..17", "Part 2: 1..20") never overwrite each other.
+ */
+function preprocessExamPages(
+  pages: Array<{ pdfPageIndex: number; text: string }>
+): {
+  markedRawText: string;
+  pageFooterKeys: Map<number, FooterAnswerPair[]>;
+} {
+  const pageFooterKeys = new Map<number, FooterAnswerPair[]>();
+  const processedPages: string[] = [];
+
+  for (const page of pages) {
+    const pageLines = (page.text || '').replace(/\r\n/g, '\n').split('\n');
+    const cleanLines: string[] = [];
+
+    // First clean margin artifacts and sidebar chrome lines while keeping footer strips visible
+    for (const rawLine of pageLines) {
+      let line = rawLine
+        // Recover question numbers colliding with left vertical banner text ("nd 2) ...", "2 5) ...")
+        .replace(/^\s*(?:1st|2nd|3rd|\dth|nd|st|rd|th|\d{1,2})\s{2,}(\d{1,3}[\.\)]\s+)/i, '$1')
+        // Strip right-margin sidebar labels appended after wide horizontal gaps
+        .replace(/\s{3,}(?:MODULE|HEMA|CVS|GIT|CNS|MSK|RESP|RENAL)\s*$/g, '');
+
+      const t = line.trim();
+      if (!t) continue;
+      if (
+        /^(?:BOOK SERIES|MCQ,\s*PRACTICAL.*|YEAR\s*\|\s*.*MODULE.*|HEMA|MODULE|\||nd|st|rd|th|\d{1,4}\s+(?:PARASITOLOGY|PHARMACOLOGY|PATHOLOGY|ANATOMY|PHYSIOLOGY|HISTOLOGY|BIOCHEMISTRY|MICROBIOLOGY|IMMUNOLOGY|HEMATOLOGY|EMBRYOLOGY|CARDIOLOGY))$/i.test(t) ||
+        /^(?:Section|Exam Models|Integrated Question Bank|Questions?\s*Bank|Pre-clinical|\d{1,4}\s+Exam Models|\d{2,4})$/i.test(t) ||
+        /^Your Daily Dose Of Progress/i.test(t) ||
+        /^\d+\s*(?:st|nd|rd|th)?\s*Medical Year/i.test(t)
+      ) {
+        continue;
+      }
+
+      cleanLines.push(line);
+    }
+
+    // Extract page-footer answer strips (2+ pairs anywhere, or 1 pair in bottom footer zone)
+    const pairsOnPage: FooterAnswerPair[] = [];
+    const bodyLines: string[] = [];
+    let sawFooterStripOnPage = false;
+
+    // Scan from bottom up first to identify the bottom footer zone accurately
+    const keepMask = new Array(cleanLines.length).fill(true);
+    for (let idx = cleanLines.length - 1; idx >= 0; idx--) {
+      const t = cleanLines[idx].trim();
+      const inBottomZone = idx >= cleanLines.length - 4 || sawFooterStripOnPage;
+      const multiPairs = parseAnswerPairLine(t, false);
+      if (multiPairs) {
+        keepMask[idx] = false;
+        sawFooterStripOnPage = true;
+        continue;
+      }
+      if (inBottomZone) {
+        const singlePair = parseAnswerPairLine(t, true);
+        if (singlePair) {
+          keepMask[idx] = false;
+          sawFooterStripOnPage = true;
         }
       }
     }
+
+    // Collect footer pairs in exact top-to-bottom order for this page
+    for (let idx = 0; idx < cleanLines.length; idx++) {
+      if (!keepMask[idx]) {
+        const parsed = parseAnswerPairLine(cleanLines[idx].trim(), true);
+        if (parsed) pairsOnPage.push(...parsed);
+      } else {
+        bodyLines.push(cleanLines[idx]);
+      }
+    }
+
+    if (pairsOnPage.length > 0) {
+      pageFooterKeys.set(page.pdfPageIndex, pairsOnPage);
+    }
+
+    processedPages.push(`<<<PAGE:${page.pdfPageIndex}>>>\n${bodyLines.join('\n')}`);
   }
-  return map;
+
+  return {
+    markedRawText: processedPages.join('\n'),
+    pageFooterKeys
+  };
+}
+
+function consumeFooterAnswer(
+  pageFooterKeys: Map<number, FooterAnswerPair[]>,
+  sourcePageIndex: number,
+  endPageIndex: number,
+  originalNum: number
+): string {
+  const pagesToTry = endPageIndex > sourcePageIndex
+    ? [sourcePageIndex, endPageIndex]
+    : [sourcePageIndex];
+
+  for (const pIdx of pagesToTry) {
+    const queue = pageFooterKeys.get(pIdx);
+    if (!queue) continue;
+    const hit = queue.find(item => !item.used && item.num === originalNum);
+    if (hit) {
+      hit.used = true;
+      return hit.ans;
+    }
+  }
+  return '';
 }
 
 /**
@@ -89,14 +215,12 @@ function splitAndParseAnswerKeys(rawText: string): {
   bodyText: string;
   sectionAnswers: Map<string, Record<number, string>>;
   orderedSections: Array<{ key: string; answers: Record<number, string> }>;
-  horizontalAnswers: Record<number, string>;
 } {
   const normalized = rawText.replace(/\r\n/g, '\n');
-  const horizontalAnswers = parseHorizontalAnswerPairs(normalized);
   const ansHeadingMatch = normalized.match(/(?:^|\n)\s*(?:Answers?|Answer\s+Keys?)\s*\n/i);
 
   if (!ansHeadingMatch || ansHeadingMatch.index === undefined) {
-    return { bodyText: normalized, sectionAnswers: new Map(), orderedSections: [], horizontalAnswers };
+    return { bodyText: normalized, sectionAnswers: new Map(), orderedSections: [] };
   }
 
   // Only treat as an appendix if it appears in the latter half of the document and contains grid rows
@@ -105,7 +229,7 @@ function splitAndParseAnswerKeys(rawText: string): {
   const hasAnswerGrid = /\b1\s+2\s+3\b/.test(candidateAppendix) && /(?:^|\n)\s*[a-eA-E](?:\s+[a-eA-E]){2,}/.test(candidateAppendix);
 
   if (!hasAnswerGrid) {
-    return { bodyText: normalized, sectionAnswers: new Map(), orderedSections: [], horizontalAnswers };
+    return { bodyText: normalized, sectionAnswers: new Map(), orderedSections: [] };
   }
 
   const bodyText = normalized.slice(0, splitPos);
@@ -121,7 +245,7 @@ function splitAndParseAnswerKeys(rawText: string): {
     const line = lines[i];
 
     // Skip running page headers inside answer pages
-    if (/^(?:Pre-clinical|Question Bank|Your Daily Dose|Exam Models|Integrated Question Bank|Section|\d+\s+Exam Models|\d+\s*(?:nd|rd|st|th)?\s*Medical Year)/i.test(line)) {
+    if (/^(?:Pre-clinical|Question Bank|Your Daily Dose|Exam Models|Integrated Question Bank|Section|\d+\s+Exam Models|\d+\s*(?:nd|rd|st|th)?\s*Medical Year|<<<PAGE:\d+>>>)/i.test(line)) {
       continue;
     }
 
@@ -157,7 +281,7 @@ function splitAndParseAnswerKeys(rawText: string): {
     orderedSections.push({ key: currentKey, answers: currentMap });
   }
 
-  return { bodyText, sectionAnswers, orderedSections, horizontalAnswers };
+  return { bodyText, sectionAnswers, orderedSections };
 }
 
 function cleanPageNoise(text: string): string {
@@ -241,15 +365,20 @@ function findOptionMatchesInBlock(block: string): RegExpMatchArray[] {
  */
 function segmentBlocksByOptionClusters(
   cleanedText: string
-): Array<{ rawBlock: string; originalNum: number; sourcePageIndex: number }> {
+): Array<{ rawBlock: string; originalNum: number; sourcePageIndex: number; endPageIndex: number }> {
   const lines = cleanedText.split('\n');
-  const results: Array<{ rawBlock: string; originalNum: number; sourcePageIndex: number }> = [];
+  const results: Array<{ rawBlock: string; originalNum: number; sourcePageIndex: number; endPageIndex: number }> = [];
 
   let curStart = 0;
   let curPage = 1;
   let curStartPage = 1;
   let seenLetters = new Set<string>();
   let lastOptionLine = -1;
+
+  const extractLastPage = (rawSlice: string, fallbackPage: number): number => {
+    const tags = Array.from(rawSlice.matchAll(/<<<PAGE:(\d+)>>>/g));
+    return tags.length > 0 ? parseInt(tags[tags.length - 1][1], 10) : fallbackPage;
+  };
 
   for (let idx = 0; idx < lines.length; idx++) {
     const line = lines[idx];
@@ -266,12 +395,14 @@ function segmentBlocksByOptionClusters(
     }
 
     // Skip footer noise / horizontal answer key strips from forming bogus trailing text
-    if (Object.keys(parseHorizontalAnswerPairs(trimmed)).length >= 3) {
+    if (parseAnswerPairLine(trimmed, false)) {
       if (lastOptionLine >= curStart) {
+        const rawSlice = lines.slice(curStart, lastOptionLine + 1).join('\n');
         results.push({
-          rawBlock: lines.slice(curStart, lastOptionLine + 1).join('\n'),
+          rawBlock: rawSlice.replace(/<<<PAGE:\d+>>>/g, '').trim(),
           originalNum: results.length + 1,
-          sourcePageIndex: curStartPage
+          sourcePageIndex: curStartPage,
+          endPageIndex: extractLastPage(rawSlice, curStartPage)
         });
         curStart = idx + 1;
         curStartPage = curPage;
@@ -309,12 +440,14 @@ function segmentBlocksByOptionClusters(
       }
 
       if (splitAt > curStart) {
-        const block = lines.slice(curStart, splitAt).join('\n').replace(/<<<PAGE:\d+>>>/g, '').trim();
+        const rawSlice = lines.slice(curStart, splitAt).join('\n');
+        const block = rawSlice.replace(/<<<PAGE:\d+>>>/g, '').trim();
         const leadingNumMatch = block.match(/^(?:Question|Q)?\s*(\d{1,3})(?=[\.\)\:\s])/i);
         results.push({
           rawBlock: block,
           originalNum: leadingNumMatch ? parseInt(leadingNumMatch[1], 10) : results.length + 1,
-          sourcePageIndex: curStartPage
+          sourcePageIndex: curStartPage,
+          endPageIndex: extractLastPage(rawSlice, curStartPage)
         });
       }
 
@@ -341,13 +474,15 @@ function segmentBlocksByOptionClusters(
 
   if (curStart < lines.length) {
     const tailEnd = lastOptionLine >= curStart ? lastOptionLine + 1 : lines.length;
-    const tail = lines.slice(curStart, tailEnd).join('\n').replace(/<<<PAGE:\d+>>>/g, '').trim();
+    const rawSlice = lines.slice(curStart, tailEnd).join('\n');
+    const tail = rawSlice.replace(/<<<PAGE:\d+>>>/g, '').trim();
     if (tail.length >= 12) {
       const leadingNumMatch = tail.match(/^(?:Question|Q)?\s*(\d{1,3})(?=[\.\)\:\s])/i);
       results.push({
         rawBlock: tail,
         originalNum: leadingNumMatch ? parseInt(leadingNumMatch[1], 10) : results.length + 1,
-        sourcePageIndex: curStartPage
+        sourcePageIndex: curStartPage,
+        endPageIndex: extractLastPage(rawSlice, curStartPage)
       });
     }
   }
@@ -362,8 +497,8 @@ export function extractExamQuestionsFromText(rawText: string): ParsedExamQuestio
 export function extractExamQuestionsFromPages(
   pages: Array<{ pdfPageIndex: number; text: string }>
 ): ParsedExamQuestion[] {
-  const rawText = pages.map(p => `<<<PAGE:${p.pdfPageIndex}>>>\n${p.text || ''}`).join('\n');
-  const { bodyText, sectionAnswers, orderedSections, horizontalAnswers } = splitAndParseAnswerKeys(rawText);
+  const { markedRawText, pageFooterKeys } = preprocessExamPages(pages);
+  const { bodyText, sectionAnswers, orderedSections } = splitAndParseAnswerKeys(markedRawText);
 
   // Clean page chrome lines while keeping Exam / Written / MCQs boundary markers intact for answer lookup
   const lines = bodyText.replace(/\r\n/g, '\n').split('\n');
@@ -420,7 +555,7 @@ export function extractExamQuestionsFromPages(
       const block = cleanPageNoise(seg.rawBlock);
       if (block.length < 8) continue;
 
-      let designatedAnswer = horizontalAnswers[seg.originalNum] || '';
+      let designatedAnswer = '';
       const ansMatch = block.match(/(?:^|\n|\s)\b(?:Answer|Ans|Key|Correct\s+Answer)\s*[:\-]\s*\(?([A-Ea-e](?:\s*,\s*[A-Ea-e])?)\)?(?!\s*[\.\)])(?=\s|$|\.|,)/i);
       if (ansMatch) {
         designatedAnswer = ansMatch[1].toUpperCase();
@@ -451,6 +586,15 @@ export function extractExamQuestionsFromPages(
           }
         }
         options.sort((x, y) => x.label.localeCompare(y.label));
+      }
+
+      if (!designatedAnswer && options.length >= 2) {
+        designatedAnswer = consumeFooterAnswer(
+          pageFooterKeys,
+          seg.sourcePageIndex,
+          seg.endPageIndex,
+          seg.originalNum
+        );
       }
 
       if (ansMatch && stem.includes(ansMatch[0])) {
@@ -498,6 +642,10 @@ export function extractExamQuestionsFromPages(
 
     // Strip any trailing section header lines that landed at the bottom of the last question on a page
     let rawBlock = cleanedText.slice(startIdx, endIdx).trim();
+    const rawPageTags = Array.from(rawBlock.matchAll(/<<<PAGE:(\d+)>>>/g));
+    const endPageIndex = rawPageTags.length > 0
+      ? parseInt(rawPageTags[rawPageTags.length - 1][1], 10)
+      : sourcePageIndex;
     rawBlock = rawBlock.replace(/\n\s*(?:Exam\s+\d+.*|MCQs|Written)\s*$/gim, '').trim();
     const block = cleanPageNoise(rawBlock);
     if (block.length < 8) continue;
@@ -558,10 +706,11 @@ export function extractExamQuestionsFromPages(
       if (/^(?:diagnosis|identify|describe the slide)\s*$/i.test(block)) continue;
     }
 
-    // Match designated answer from parsed Answer Key section or horizontal strip if not present inline
+    // Match designated answer from parsed Answer Key section or page-scoped horizontal strip if not present inline
     if (!designatedAnswer && options.length >= 2 && !inWrittenSection) {
-      if (horizontalAnswers[originalNum]) {
-        designatedAnswer = horizontalAnswers[originalNum];
+      const footerAns = consumeFooterAnswer(pageFooterKeys, sourcePageIndex, endPageIndex, originalNum);
+      if (footerAns) {
+        designatedAnswer = footerAns;
       } else if (orderedSections.length > 0) {
         let matchedMap = latestSectionKey ? sectionAnswers.get(latestSectionKey) : undefined;
         if (!matchedMap && latestSectionKey) {

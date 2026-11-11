@@ -148,11 +148,22 @@ export function sanitizeAiResponse(
     hasMulti = proposedAnswers.length > 1;
     const stemDefect = Boolean(stemEval.has_scientific_error) || Boolean(stemEval.has_linguistic_ambiguity);
 
-    if (
-      hasValidDesignatedKey &&
+    const desLetters = /^[A-E](?:\s*,\s*[A-E])*$/.test(desNorm)
+      ? Array.from(new Set(desNorm.split(/\s*,\s*/).filter(Boolean))).sort()
+      : [];
+    const propLetters = Array.from(new Set(proposedAnswers.map(a => a.trim().toUpperCase()))).sort();
+    const matchesDesignatedKeySet =
+      desLetters.length > 0 &&
+      desLetters.length === propLetters.length &&
+      desLetters.every((l, idx) => l === propLetters[idx]);
+    const matchesSingleKey =
       proposedAnswers.length === 1 &&
       proposedAnswers[0].toUpperCase() === desNorm &&
-      !hasMulti &&
+      !hasMulti;
+
+    if (
+      hasValidDesignatedKey &&
+      (matchesDesignatedKeySet || matchesSingleKey) &&
       !hasNoCorrect &&
       !stemDefect
     ) {
@@ -163,7 +174,7 @@ export function sanitizeAiResponse(
       }
     } else if (
       hasValidDesignatedKey &&
-      /^[A-E]$/.test(desNorm) &&
+      desLetters.length > 0 &&
       !isOrigCorrect &&
       finalCategory === 'confirmed_error' &&
       confidence < 85
