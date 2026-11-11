@@ -3,6 +3,7 @@ import { AIAuditResponse, FindingsCategory, ErrorSeverity } from './schemas';
 import { QuestionSearchBundle, RetrievedEvidence } from '@/lib/search/semantic';
 import { auditIndividualOption } from '@/lib/audit/option-checker';
 import { analyzeCrossReferenceConflicts } from '@/lib/audit/conflict-resolver';
+import { isInvertedPolarityQuestion } from '@/lib/audit/question-polarity';
 
 const modelCooldownUntil: Record<string, number> = {};
 
@@ -41,7 +42,7 @@ Before answering, explicitly perform THREE reading passes:
 PASS 1 — IDENTIFY THE EXACT QUESTION TYPE:
    • What SPECIFIC thing is being asked? (e.g., "which drug INHIBITS", "which statement is TRUE", "which structure lies BEHIND", "what is the MOST COMMON cause", "what is the MECHANISM of action")
    • Extract the key interrogative verb/phrase: inhibit, stimulate, increase, decrease, lies behind, anterior to, most common, least common, characteristic of, NOT true, EXCEPT, etc.
-   • WARNING: "EXCEPT" / "NOT" questions invert the answer logic — the correct answer is the FALSE statement, not the true one.
+   • WARNING: "EXCEPT" / "NOT" / "INCORRECT" / "FALSE" / "LEAST" questions invert the answer logic — the winning answer is the FALSE / excluded option, NOT the true statements. For inverted questions, option_analyses[].is_correct MUST represent whether the option is the WINNING ANSWER TO THE QUESTION (true ONLY for the false/excluded statement; false for true statements that are eliminated by EXCEPT), and proposed_correct_answers MUST contain ONLY the exception letter(s). NEVER list the true statements in proposed_correct_answers or flag MULTIPLE CORRECT unless 2+ options are factually false.
 
 PASS 2 — UNDERSTAND THE CLINICAL / SCIENTIFIC CONTEXT:
    • Who is the patient? (age, sex, clinical setting, comorbidities)
@@ -102,7 +103,33 @@ PART D — STRICT TERMINOLOGY AND STRUCTURAL READING
 20. CROSS-PAGE CONTRADICTION & SHORTHAND ERRATUM GUARD: Lecture notes and student handouts occasionally contain a brief shorthand list item or copy-paste typo (e.g., listing a communicating/anastomotic structure without an explicit drainage verb, or mistyping one bullet). Before accepting any secondary option as "CORRECT" to declare has_multiple_correct_answers=true or overwrite a clearly verified designated key:
     a) Check ALL other excerpts in the prompt for statements about that structure (e.g., if Page A briefly lists "8 - Vena azygos ." under IVC while Page B states "The S.V.C. has only one tributary, the azygos vein" or places it under "Anastomoses between I.V.C. & S.V.C.", recognize that contradiction).
     b) Check whether universal established medical science confirms that shorthand item is factually an anastomotic connection or author erratum rather than the stated claim (e.g. azygos vein drains primarily into SVC, NOT IVC).
-    When an isolated shorthand bullet conflicts with another textbook excerpt or universal core medical anatomy/physiology while the designated answer is cleanly verified, do NOT mark the conflicting bullet as is_correct=true and do NOT trigger MULTIPLE CORRECT; mark that option INCORRECT and explain the textbook conflict transparently.`;
+    When an isolated shorthand bullet conflicts with another textbook excerpt or universal core medical anatomy/physiology while the designated answer is cleanly verified, do NOT mark the conflicting bullet as is_correct=true and do NOT trigger MULTIPLE CORRECT; mark that option INCORRECT and explain the textbook conflict transparently.
+
+══════════════════════════════════════════════════════
+PART E — QUANTITATIVE, OCR LAYOUT & KEY DEFENSE GATES
+(CRITICAL: Eliminate false error overrides of valid keys)
+══════════════════════════════════════════════════════
+21. EXACT NUMBER, QUALIFIER & CITATION CONSISTENCY AUDIT:
+    Before setting is_correct=true on an option or citing a textbook quote, compare the EXACT numbers, percentages, units, directions ("increase" vs "decrease"), and qualifiers between the option and the quote:
+    - "as high as 700%" REFUTES an option saying "200%" (NEVER cite a quote containing "700%" to confirm "200%").
+    - "Non-clear internal elastic lamina" in the aorta REFUTES an option claiming IEL is "most prominent in large elastic arteries like the aorta".
+    - Causes listed under "ACUTE HEART FAILURE" (e.g. recent myocardial infarction, haemopericardium, massive PE) CANNOT confirm an option for "CHRONIC heart failure".
+    Never mark an option correct when your own cited quote contradicts its value or qualifier.
+
+22. OCR SLIDE / TABLE ROW AFFILIATION GUARD:
+    Lecture slides extracted via OCR sometimes omit a colored subheader or concatenate two adjacent table entries vertically (for instance: Subtype 1 followed by "Rare", then immediately below it "Most common (90%) ... Pathology: Markedly dilated heart" belonging to Subtype 2 whose box title did not OCR cleanly).
+    Never attach a statistic ("Most common (90%)") to an entry whose own bullets say "Rare", or whose pathology ("Markedly dilated heart" = dilated/congestive cardiomyopathy) belongs to the next sibling category. Cross-check ambiguous list alignments against universal core medical knowledge.
+
+23. SYMMETRIC BURDEN OF PROOF BEFORE OVERRIDING A DESIGNATED ANSWER KEY:
+    To set is_original_key_correct=false and findings_category="confirmed_error", BOTH of the following MUST be satisfied:
+    a) The designated answer key option is DIRECTLY and UNAMBIGUOUSLY refuted by an explicit textbook statement or indisputable core medical error — NOT merely because a list omits an arrow ("Heart rate" under preload determinants -> prolonged diastole at decreased HR increases preload), NOT on minor preposition/phrasing differences ("at the inguinal ligament" vs "behind the inguinal ligament"; "tension-length curve" vs "Frank-Starling/ventricular curve"), and NOT via a single-equation multi-hop inference that conflicts with another excerpt page (e.g., citing "as RAP decreases -> VR increases" while another page states "increased RAP increases EDV/COP" and "RAP is the main force for ventricular filling").
+    b) Your proposed replacement answer is unambiguously and directly proven across ALL relevant excerpts without distorting scope (e.g., extreme HR > 220 or acute rescue vs ongoing prophylaxis).
+    If the designated key is physiologically/anatomically valid and defensible from the excerpts and core medical science, CONFIRM the designated key (is_original_key_correct=true, findings_category="no_detected_issue").
+
+24. MISSING COVERAGE VS FALSE "NO CORRECT ANSWER":
+    NEVER set has_no_correct_answer=true and findings_category="confirmed_error" when:
+    - The textbook excerpts do not cover the question topic at all (use "insufficient_evidence" instead), OR
+    - One option aligns with the core medical truth / textbook mechanism while all other choices are clearly false, even if a secondary qualifier in that option is absent from a brief lecture bullet (e.g. chemoreceptor firing during severe hypotension, hyperglycemia in atherosclerosis).`;
 
 function parseGeminiCooldown(errTxt: string, retryAfterHeader: string | null): { cooldownMs: number; isDailyExhausted: boolean } {
   const isDailyLimit = /per day limit exceeded|limit:\s*0\b/i.test(errTxt);
@@ -228,7 +255,8 @@ function runBuiltInMedicalAuditor(
   }
 
   // Audit each option independently (combining option-specific and stem evidence pages)
-  const optionAnalyses = options.map(opt => {
+  const isInverted = isInvertedPolarityQuestion(stem);
+  const rawOptionAnalyses = options.map(opt => {
     const optSpecific = evidenceBundle.optionsEvidence[opt.label] || [];
     const combinedEv = [...optSpecific, ...evidenceBundle.stemEvidence];
     const optEvidence = combinedEv.length > 0 ? combinedEv : evidenceBundle.allRetrievedPages;
@@ -244,6 +272,20 @@ function runBuiltInMedicalAuditor(
       citation_quote: evaluated.citationQuote
     };
   });
+
+  // For inverted-polarity questions (EXCEPT / NOT / FALSE), if >= 2 options are verified as true statements
+  // and at least 1 option is false/unverified, invert selection so the false statement is the winning answer.
+  const optionAnalyses = isInverted &&
+    rawOptionAnalyses.filter(o => o.is_correct).length >= 2 &&
+    rawOptionAnalyses.some(o => !o.is_correct)
+    ? rawOptionAnalyses.map(o => ({
+        ...o,
+        is_correct: !o.is_correct,
+        explanation: !o.is_correct
+          ? `[CORRECT EXCEPTION]: ${o.explanation}`
+          : `[True statement - NOT the exception]: ${o.explanation}`
+      }))
+    : rawOptionAnalyses;
 
   const correctOptions = optionAnalyses.filter(o => o.is_correct).map(o => o.option_letter);
   const desKey = (designatedAnswer || '').trim().toUpperCase();
@@ -345,73 +387,7 @@ function runBuiltInMedicalAuditor(
   };
 }
 
-/**
- * Execute AI validation using configured provider (Gemini / OpenAI / Claude / Built-in)
- */
-export async function auditQuestionWithAI(
-  stem: string,
-  options: Array<{ label: string; text: string }>,
-  designatedAnswer: string,
-  evidenceBundle: QuestionSearchBundle,
-  providerOverride?: string
-): Promise<AIAuditResponse> {
-  const provider = providerOverride || getSetting('ai_provider', 'built_in');
-  const geminiKey = getSetting('gemini_api_key') || process.env.GEMINI_API_KEY;
-  const openaiKey = getSetting('openai_api_key') || process.env.OPENAI_API_KEY;
-  const anthropicKey = getSetting('anthropic_api_key') || process.env.ANTHROPIC_API_KEY;
-
-  // Select balanced evidence: reserve core stem hits + top hit(s) per option so generic option terms cannot drown out the stem topic or counter-evidence pages
-  const pickedMap = new Map<string, RetrievedEvidence>();
-  const addPicked = (ev: RetrievedEvidence) => {
-    const k = `${ev.referenceBookName}:${ev.pdfPageIndex}`;
-    const existing = pickedMap.get(k);
-    if (!existing || existing.relevanceScore < ev.relevanceScore) {
-      pickedMap.set(k, ev);
-    }
-  };
-
-  for (const ev of [...evidenceBundle.stemEvidence].sort((a, b) => b.relevanceScore - a.relevanceScore).slice(0, 5)) {
-    addPicked(ev);
-  }
-  for (const optEv of Object.values(evidenceBundle.optionsEvidence)) {
-    // Preserve curated diversity order from semantic retrieval (combined #1 + standalone definition #1)
-    for (const ev of optEv.slice(0, 2)) {
-      if (pickedMap.size >= 14) break;
-      addPicked(ev);
-    }
-  }
-  for (const ev of [...evidenceBundle.allRetrievedPages].sort((a, b) => b.relevanceScore - a.relevanceScore)) {
-    if (pickedMap.size >= 14) break;
-    addPicked(ev);
-  }
-  const topEvidence = Array.from(pickedMap.values())
-    .sort((a, b) => b.relevanceScore - a.relevanceScore)
-    .slice(0, 14);
-
-  const evidenceText = topEvidence
-    .map((ev, idx) => `[Source ${idx + 1}: ${ev.referenceBookName} | Printed Page: ${ev.printedPageNumber} | PDF Index: ${ev.pdfPageIndex}]\n"${ev.fullPageContent.slice(0, 2600)}"`)
-    .join('\n\n');
-
-  const optionsBlock = options.length > 0
-    ? options.map(o => `${o.label}) ${o.text}`).join('\n')
-    : 'Written / Open-Ended Question (No multiple-choice options; audit scientific accuracy of stem and any included model answer, keep option_analyses empty [])';
-
-  const userPrompt = `AUDIT REQUEST:
-QUESTION STEM:
-${stem}
-
-OPTIONS:
-${optionsBlock}
-
-DESIGNATED ANSWER KEY:
-${designatedAnswer || 'Not provided'}
-
-EXCLUSIVE REFERENCE EVIDENCE EXCERPTS:
-${evidenceText || 'No reference excerpts retrieved.'}
-
-Perform the comprehensive scientific audit adhering strictly to ALL Scientific Integrity, Comprehension, Exact Terminology, and Structural Context Rules above.
-Output valid JSON adhering to this schema:
-{
+const AUDIT_RESPONSE_JSON_SCHEMA = `{
   "stem_evaluation": {
     "has_scientific_error": boolean,
     "has_linguistic_ambiguity": boolean,
@@ -459,8 +435,429 @@ Output valid JSON adhering to this schema:
   "conflict_explanation": string or null
 }`;
 
-  // If Gemini provider is configured and key is present
+function escapeControlCharsInJsonStrings(input: string): string {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (escaped) {
+      out += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      out += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      out += ch;
+      inString = !inString;
+      continue;
+    }
+    if (inString) {
+      const code = ch.charCodeAt(0);
+      if (ch === '\n') { out += '\\n'; continue; }
+      if (ch === '\r') { out += '\\r'; continue; }
+      if (ch === '\t') { out += '\\t'; continue; }
+      if (code < 0x20) { out += ' '; continue; }
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function parseLlmJsonResponse(rawText: string): AIAuditResponse {
+  const cleaned = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  try {
+    return JSON.parse(cleaned) as AIAuditResponse;
+  } catch {
+    const firstBrace = cleaned.indexOf('{');
+    const lastBrace = cleaned.lastIndexOf('}');
+    const target = (firstBrace >= 0 && lastBrace > firstBrace)
+      ? cleaned.slice(firstBrace, lastBrace + 1)
+      : cleaned;
+    const repaired = escapeControlCharsInJsonStrings(target).replace(/,\s*([}\]])/g, '$1');
+    return JSON.parse(repaired) as AIAuditResponse;
+  }
+}
+
+async function callGeminiWithCandidates(
+  promptText: string,
+  candidateModels: string[],
+  geminiKey: string,
+  timeoutMs: number = 30000,
+  temperature: number = 0.1
+): Promise<{ parsed: AIAuditResponse | null; error: string }> {
   let lastExternalError = '';
+  const maxRounds = 5;
+
+  for (let round = 0; round < maxRounds; round++) {
+    let triedAnyModelThisRound = false;
+
+    for (const model of candidateModels) {
+      if (Date.now() < (modelCooldownUntil[model] || 0)) {
+        continue;
+      }
+      triedAnyModelThisRound = true;
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
+          const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: AbortSignal.timeout(timeoutMs),
+            body: JSON.stringify({
+              contents: [
+                {
+                  role: 'user',
+                  parts: [{ text: promptText }]
+                }
+              ],
+              generationConfig: {
+                responseMimeType: 'application/json',
+                temperature
+              }
+            })
+          });
+
+          if (res.ok) {
+            const data = await res.json();
+            const rawJson = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (rawJson) {
+              return { parsed: parseLlmJsonResponse(rawJson), error: '' };
+            }
+          } else {
+            const errTxt = await res.text().catch(() => '');
+            lastExternalError = `Gemini ${model} HTTP ${res.status}: ${errTxt.slice(0, 220)}`;
+            console.warn(lastExternalError);
+            if (res.status === 404 || res.status === 400) {
+              modelCooldownUntil[model] = Date.now() + 12 * 3600 * 1000;
+              break;
+            }
+            if (res.status === 429) {
+              const { cooldownMs } = parseGeminiCooldown(errTxt, res.headers.get('retry-after'));
+              modelCooldownUntil[model] = Date.now() + cooldownMs;
+              break;
+            }
+            if (res.status === 503) {
+              if (attempt === 0) {
+                await new Promise(r => setTimeout(r, 1200));
+                continue;
+              }
+              modelCooldownUntil[model] = Date.now() + 30000;
+            }
+          }
+          break;
+        } catch (err: any) {
+          lastExternalError = `Gemini ${model} error: ${err?.message || 'network timeout'}`;
+          console.warn(`Gemini API call with model ${model} attempt ${attempt + 1} failed:`, err);
+          if (attempt === 0) {
+            await new Promise(r => setTimeout(r, 800));
+          }
+        }
+      }
+    }
+
+    if (round < maxRounds - 1) {
+      const now = Date.now();
+      const remainingWaits = candidateModels.map(m => Math.max(0, (modelCooldownUntil[m] || 0) - now));
+      const minWaitMs = Math.min(...remainingWaits);
+      if (minWaitMs > 90000) {
+        console.warn(`[Gemini] Daily quota exhausted across all candidate models (next reset in ${Math.round(minWaitMs / 60000)}m). Failing fast.`);
+        break;
+      }
+      const sleepMs = !triedAnyModelThisRound
+        ? Math.min(Math.max(minWaitMs + 500, 4000), 70000)
+        : (minWaitMs > 0 ? Math.min(minWaitMs + 500, 70000) : 2500);
+      console.log(`[Gemini] Candidate models temporarily throttled, sleeping ${Math.round(sleepMs / 1000)}s before round ${round + 2}/${maxRounds}...`);
+      await new Promise(r => setTimeout(r, sleepMs));
+    }
+  }
+
+  return {
+    parsed: null,
+    error: lastExternalError || 'All candidate Gemini models temporarily exhausted RPM quota'
+  };
+}
+
+async function callOpenAiChatJson(
+  systemPrompt: string,
+  userPrompt: string,
+  openaiKey: string,
+  model: string,
+  timeoutMs: number = 30000,
+  temperature: number = 0.1
+): Promise<{ parsed: AIAuditResponse | null; error: string }> {
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${openaiKey}`
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+      body: JSON.stringify({
+        model,
+        response_format: { type: 'json_object' },
+        temperature,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ]
+      })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const content = data.choices?.[0]?.message?.content;
+      if (content) {
+        return { parsed: parseLlmJsonResponse(content), error: '' };
+      }
+    }
+    return { parsed: null, error: `OpenAI HTTP ${res.status}` };
+  } catch (err: any) {
+    console.warn('OpenAI API call failed:', err);
+    return { parsed: null, error: err?.message || 'OpenAI request error' };
+  }
+}
+
+/**
+ * Determine whether a Pass-1 audit output challenges the exam or shows an inverted-polarity anomaly
+ * and therefore warrants Stage-2 Peer-Review Verification before accepting an error claim.
+ */
+function shouldRunPeerReviewChallenge(
+  pass1: AIAuditResponse,
+  designatedAnswer: string,
+  isInverted: boolean
+): boolean {
+  const cat = pass1?.findings_category;
+  const ansEval = pass1?.answer_key_evaluation;
+  const hasDesignated = Boolean(designatedAnswer && !/^\s*(?:not\s+provided|none)\s*$/i.test(designatedAnswer));
+
+  if (cat === 'confirmed_error' || cat === 'highly_probable_error' || cat === 'potential_error') {
+    return true;
+  }
+  if (hasDesignated && ansEval?.is_original_key_correct === false) {
+    return true;
+  }
+  if (ansEval?.has_multiple_correct_answers || ansEval?.has_no_correct_answer) {
+    return true;
+  }
+  if (isInverted && Array.isArray(pass1?.option_analyses)) {
+    const trueCount = pass1.option_analyses.filter(o => o.is_correct).length;
+    if (trueCount > 1) return true;
+  }
+  return false;
+}
+
+/**
+ * Stage 2: Strict Peer-Review Challenge Audit.
+ * Independently challenges Pass-1 error verdicts to catch false overrides, number/qualifier
+ * contradictions, OCR table row confusion, pedantic no-correct claims, and EXCEPT polarity flips.
+ */
+async function verifyFlaggedAuditFinding(params: {
+  stem: string;
+  optionsBlock: string;
+  designatedAnswer: string;
+  isInverted: boolean;
+  evidenceText: string;
+  pass1: AIAuditResponse;
+  provider: string;
+  geminiKey?: string;
+  openaiKey?: string;
+  geminiModels: string[];
+  openaiModel: string;
+}): Promise<AIAuditResponse> {
+  const {
+    stem,
+    optionsBlock,
+    designatedAnswer,
+    isInverted,
+    evidenceText,
+    pass1,
+    provider,
+    geminiKey,
+    openaiKey,
+    geminiModels,
+    openaiModel
+  } = params;
+
+  const compactPass1 = {
+    findings_category: pass1.findings_category,
+    confidence_score: pass1.confidence_score,
+    answer_key_evaluation: pass1.answer_key_evaluation,
+    option_analyses: (pass1.option_analyses || []).map(o => ({
+      option_letter: o.option_letter,
+      is_correct: o.is_correct,
+      citation_book: o.citation_book,
+      citation_page: o.citation_page,
+      citation_quote: o.citation_quote,
+      explanation: o.explanation
+    }))
+  };
+
+  const reviewSystem = `You are a Senior Medical Board Chief Examiner performing a skeptical PEER-REVIEW AUDIT of a preliminary automated question-error flag.
+False positive error flags destroy user trust. Your mission is to verify strictly whether the preliminary challenge holds up under rigorous textbook and medical examination — rejecting weak, pedantic, contradictory, or logically inverted error claims while upholding GENUINE exam errors.`;
+
+  const reviewPrompt = `PEER-REVIEW AUDIT REQUEST:
+
+QUESTION STEM:
+${stem}
+
+QUESTION POLARITY:
+${isInverted ? 'INVERTED POLARITY (EXCEPT / NOT / INCORRECT / FALSE / LEAST — the winning choice is the FALSE/excluded option, NEVER the true statements!)' : 'STANDARD POSITIVE SELECTION'}
+
+OPTIONS:
+${optionsBlock}
+
+DESIGNATED ANSWER KEY:
+${designatedAnswer || 'Not provided'}
+
+PRELIMINARY VERDICT TO AUDIT:
+${JSON.stringify(compactPass1, null, 2)}
+
+REFERENCE TEXTBOOK EXCERPTS:
+${evidenceText || 'No reference excerpts retrieved.'}
+
+PERFORM THESE 5 MANDATORY CHECKS STRICTLY:
+1. INVERTED POLARITY CHECK:
+   If QUESTION POLARITY is INVERTED, confirm that ONLY the false/excluded choice(s) have "is_correct": true and appear in "proposed_correct_answers". If the preliminary verdict marked true statements as is_correct=true or MULTIPLE CORRECT on an EXCEPT/NOT question, FIX IT immediately (true statements -> is_correct: false; the false exception -> is_correct: true).
+
+2. LITERAL NUMBER, UNIT & QUALIFIER CHECK:
+   Inspect EVERY citation_quote and option claim in the preliminary verdict:
+   - Do the exact numbers/percentages match? (e.g., "700%" does NOT support "200%"; "70 to 200 ml" DOES support "200 mL").
+   - Do qualifiers match? (e.g., "Non-clear internal elastic lamina" in aorta REFUTES "most prominent in large elastic arteries like the aorta"; "Acute heart failure" causes do NOT confirm "Chronic heart failure").
+   - Did Pass 1 attach a statistic ("Most common (90%)") from an OCR table row ("Markedly dilated heart") to a sibling heading whose own bullet says "Rare" (e.g. IHSS/hypertrophic cardiomyopathy)? If so, CORRECT IT.
+
+3. DESIGNATED ANSWER KEY DEFENSE TEST (CRITICAL):
+   Assume the exam author had a sound textbook/medical reason for selecting "${designatedAnswer || 'None'}". Actively try to DEFEND "${designatedAnswer || 'None'}" using the excerpts and established medical physiology/anatomy/pathology:
+   - Example: Decreasing heart rate prolongs diastolic filling time -> increases EDV/preload ("Heart rate" is listed under preload determinants); conversely using "RAP decreases -> VR increases" to claim decreased RAP increases preload ignores another excerpt saying "increased RAP increases EDV/COP" and "RAP is main force for ventricular filling".
+   - Example: Increased venous compliance decreases MSFP (reducing filling pressure & venous return -> decreases diastolic filling rate) directly, whereas sympathetic stimulation increases MSFP/CO unless HR > 220.
+   - Example: Preposition or terminology phrasing differences ("at the inguinal ligament" vs "behind the inguinal ligament", "tension-length curve" vs "Starling curve", or a missing minor risk factor alongside a true textbook factor when the other 3 options are clearly false) are NOT grounds to fail a valid designated key!
+   - If the designated key IS scientifically valid/defensible OR Pass 1's challenge relies on multi-hop deductions, OCR table conflation, wrong numbers/qualifiers, or pedantry -> OVERTURN Pass 1 and return is_original_key_correct=true, proposed_correct_answers=["${designatedAnswer || ''}"], findings_category="no_detected_issue", error_severity="none" (unless designatedAnswer is "Not provided").
+   - ONLY UPHOLD findings_category="confirmed_error" if the designated key is truly indefensible against explicit evidence (e.g., naming Staph aureus for subacute endocarditis when excerpts specify Strep viridans/weak bacteria vs Staph aureus for acute endocarditis), OR two options are indisputably correct under the EXACT SAME clinical scope and textbook heading.
+
+4. "NO CORRECT ANSWER" & "MULTIPLE CORRECT" AUDIT:
+   - Never uphold has_no_correct_answer=true when excerpts simply don't cover the topic (use "insufficient_evidence"), nor when the designated key reflects standard textbook science despite brief bullet wording.
+   - Never uphold has_multiple_correct_answers=true for a secondary option that differs in terminology suffix (stenosis vs incompetence), wrong category/stage, acute rescue vs ongoing prophylaxis when distinction applies, or a textbook shorthand erratum contradicted elsewhere (Rule 20).
+
+5. OUTPUT COMPLETE CORRECTED JSON adhering strictly to this schema (preserving verified citations cleanly):
+${AUDIT_RESPONSE_JSON_SCHEMA}`;
+
+  if (provider === 'gemini' && geminiKey) {
+    // Prefer full flagship non-lite reasoning models first for Stage-2 peer review (~3-5% of questions)
+    const stage2Models = [
+      'gemini-3-flash-preview',
+      'gemini-3.5-flash',
+      'gemini-3.8-flash',
+      ...geminiModels
+    ].filter((v, i, a) => Boolean(v) && a.indexOf(v) === i);
+
+    const { parsed } = await callGeminiWithCandidates(
+      `${reviewSystem}\n\n${reviewPrompt}`,
+      stage2Models,
+      geminiKey,
+      45000,
+      0.0
+    );
+    if (parsed) return parsed;
+  } else if (provider === 'openai' && openaiKey) {
+    const { parsed } = await callOpenAiChatJson(
+      reviewSystem,
+      reviewPrompt,
+      openaiKey,
+      openaiModel,
+      40000,
+      0.0
+    );
+    if (parsed) return parsed;
+  }
+
+  return pass1;
+}
+
+/**
+ * Execute AI validation using configured provider (Gemini / OpenAI / Claude / Built-in)
+ */
+export async function auditQuestionWithAI(
+  stem: string,
+  options: Array<{ label: string; text: string }>,
+  designatedAnswer: string,
+  evidenceBundle: QuestionSearchBundle,
+  providerOverride?: string
+): Promise<AIAuditResponse> {
+  const provider = providerOverride || getSetting('ai_provider', 'built_in');
+  const geminiKey = getSetting('gemini_api_key') || process.env.GEMINI_API_KEY;
+  const openaiKey = getSetting('openai_api_key') || process.env.OPENAI_API_KEY;
+
+  // Select balanced evidence: reserve core stem hits + top hit(s) per option so generic option terms cannot drown out the stem topic or counter-evidence pages
+  const pickedMap = new Map<string, RetrievedEvidence>();
+  const addPicked = (ev: RetrievedEvidence) => {
+    const k = `${ev.referenceBookName}:${ev.pdfPageIndex}`;
+    const existing = pickedMap.get(k);
+    if (!existing || existing.relevanceScore < ev.relevanceScore) {
+      pickedMap.set(k, ev);
+    }
+  };
+
+  for (const ev of [...evidenceBundle.stemEvidence].sort((a, b) => b.relevanceScore - a.relevanceScore).slice(0, 5)) {
+    addPicked(ev);
+  }
+  for (const optEv of Object.values(evidenceBundle.optionsEvidence)) {
+    // Preserve curated diversity order from semantic retrieval (combined #1 + standalone definition #1)
+    for (const ev of optEv.slice(0, 2)) {
+      if (pickedMap.size >= 14) break;
+      addPicked(ev);
+    }
+  }
+  for (const ev of [...evidenceBundle.allRetrievedPages].sort((a, b) => b.relevanceScore - a.relevanceScore)) {
+    if (pickedMap.size >= 14) break;
+    addPicked(ev);
+  }
+  const topEvidence = Array.from(pickedMap.values())
+    .sort((a, b) => b.relevanceScore - a.relevanceScore)
+    .slice(0, 14);
+
+  const evidenceText = topEvidence
+    .map((ev, idx) => `[Source ${idx + 1}: ${ev.referenceBookName} | Printed Page: ${ev.printedPageNumber} | PDF Index: ${ev.pdfPageIndex}]\n"${ev.fullPageContent.slice(0, 2600)}"`)
+    .join('\n\n');
+
+  const optionsBlock = options.length > 0
+    ? options.map(o => `${o.label}) ${o.text}`).join('\n')
+    : 'Written / Open-Ended Question (No multiple-choice options; audit scientific accuracy of stem and any included model answer, keep option_analyses empty [])';
+
+  const isInverted = isInvertedPolarityQuestion(stem);
+  const polarityBlock = isInverted
+    ? `INVERTED POLARITY (EXCEPT / NOT / INCORRECT / FALSE / LEAST QUESTION DETECTED):
+- You are looking for the ONE option that is SCIENTIFICALLY FALSE or EXCLUDED.
+- In "option_analyses": set "is_correct": true ONLY for the winning answer to this EXCEPT/NOT question (i.e., the FALSE statement), and begin its explanation with "[CORRECT EXCEPTION]: ...". Set "is_correct": false for options that are TRUE statements (they are eliminated by EXCEPT), and begin their explanation with "[True statement - NOT the exception]: ...".
+- In "answer_key_evaluation": "proposed_correct_answers" MUST list ONLY the false/exception letter (NEVER the 3 true statements!), and NEVER flag has_multiple_correct_answers=true merely because 3 statements are factually true.`
+    : `STANDARD POSITIVE SELECTION:
+- Set "is_correct": true ONLY for option(s) that are scientifically accurate answers to what the stem asks, and "is_correct": false for incorrect choices.`;
+
+  const userPrompt = `AUDIT REQUEST:
+QUESTION STEM:
+${stem}
+
+QUESTION LOGIC MODE:
+${polarityBlock}
+
+OPTIONS:
+${optionsBlock}
+
+DESIGNATED ANSWER KEY:
+${designatedAnswer || 'Not provided'}
+
+EXCLUSIVE REFERENCE EVIDENCE EXCERPTS:
+${evidenceText || 'No reference excerpts retrieved.'}
+
+Perform the comprehensive scientific audit adhering strictly to ALL Scientific Integrity, Comprehension, Exact Terminology, Structural Context, Quantitative, and Key Defense Rules above.
+Output valid JSON adhering to this schema:
+${AUDIT_RESPONSE_JSON_SCHEMA}`;
+
   if (provider === 'gemini') {
     if (!geminiKey) {
       return buildUnavailableProviderFallback(options, designatedAnswer, evidenceBundle, 'gemini', 'missing GEMINI_API_KEY');
@@ -473,137 +870,75 @@ Output valid JSON adhering to this schema:
       'gemini-3.1-flash-lite',
       'gemini-3.1-flash-lite-preview',
       'gemini-3-flash-preview',
-      'gemini-3.5-flash'
+      'gemini-3.5-flash',
+      'gemini-3.8-flash'
     ].filter((v, i, a) => Boolean(v) && a.indexOf(v) === i);
 
-    const maxRounds = 5;
-    for (let round = 0; round < maxRounds; round++) {
-      let triedAnyModelThisRound = false;
+    const { parsed: pass1, error } = await callGeminiWithCandidates(
+      `${SYSTEM_INSTRUCTIONS}\n\n${userPrompt}`,
+      candidateModels,
+      geminiKey,
+      30000,
+      0.1
+    );
 
-      for (const model of candidateModels) {
-        if (Date.now() < (modelCooldownUntil[model] || 0)) {
-          continue;
-        }
-        triedAnyModelThisRound = true;
-
-        for (let attempt = 0; attempt < 2; attempt++) {
-          try {
-            const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`;
-            const res = await fetch(url, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              signal: AbortSignal.timeout(25000),
-              body: JSON.stringify({
-                contents: [
-                  {
-                    role: 'user',
-                    parts: [{ text: `${SYSTEM_INSTRUCTIONS}\n\n${userPrompt}` }]
-                  }
-                ],
-                generationConfig: {
-                  responseMimeType: 'application/json',
-                  temperature: 0.1
-                }
-              })
-            });
-
-            if (res.ok) {
-              const data = await res.json();
-              let rawJson = data.candidates?.[0]?.content?.parts?.[0]?.text;
-              if (rawJson) {
-                rawJson = rawJson.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-                const parsed = JSON.parse(rawJson);
-                return parsed as AIAuditResponse;
-              }
-            } else {
-              const errTxt = await res.text().catch(() => '');
-              lastExternalError = `Gemini ${model} HTTP ${res.status}: ${errTxt.slice(0, 220)}`;
-              console.warn(lastExternalError);
-              if (res.status === 429) {
-                const { cooldownMs } = parseGeminiCooldown(errTxt, res.headers.get('retry-after'));
-                modelCooldownUntil[model] = Date.now() + cooldownMs;
-                break;
-              }
-              if (res.status === 503 && attempt === 0) {
-                await new Promise(r => setTimeout(r, 1200));
-                continue;
-              }
-            }
-            break;
-          } catch (err: any) {
-            lastExternalError = `Gemini ${model} error: ${err?.message || 'network timeout'}`;
-            console.warn(`Gemini API call with model ${model} attempt ${attempt + 1} failed:`, err);
-            if (attempt === 0) {
-              await new Promise(r => setTimeout(r, 800));
-            }
-          }
-        }
-      }
-
-      // Check remaining cooldowns: if it is a short RPM limit (<= 90s), wait it out;
-      // if all models hit daily quota exhaustion (> 90s), fail fast instead of hanging minutes per question.
-      if (round < maxRounds - 1) {
-        const now = Date.now();
-        const remainingWaits = candidateModels.map(m => Math.max(0, (modelCooldownUntil[m] || 0) - now));
-        const minWaitMs = Math.min(...remainingWaits);
-        if (minWaitMs > 90000) {
-          console.warn(`[Gemini] Daily quota exhausted across all candidate models (next reset in ${Math.round(minWaitMs / 60000)}m). Failing fast.`);
-          break;
-        }
-        const sleepMs = !triedAnyModelThisRound
-          ? Math.min(Math.max(minWaitMs + 500, 5000), 70000)
-          : (minWaitMs > 0 ? Math.min(minWaitMs + 500, 70000) : 3000);
-        console.log(`[Gemini] All models in temporary RPM cooldown, sleeping ${Math.round(sleepMs / 1000)}s before round ${round + 2}/${maxRounds}...`);
-        await new Promise(r => setTimeout(r, sleepMs));
-      }
+    if (!pass1) {
+      return buildUnavailableProviderFallback(options, designatedAnswer, evidenceBundle, 'gemini', error);
     }
 
-    return buildUnavailableProviderFallback(
-      options,
-      designatedAnswer,
-      evidenceBundle,
-      'gemini',
-      lastExternalError || 'All candidate Gemini models temporarily exhausted RPM quota'
-    );
+    if (shouldRunPeerReviewChallenge(pass1, designatedAnswer, isInverted)) {
+      return await verifyFlaggedAuditFinding({
+        stem,
+        optionsBlock,
+        designatedAnswer,
+        isInverted,
+        evidenceText,
+        pass1,
+        provider: 'gemini',
+        geminiKey,
+        geminiModels: candidateModels,
+        openaiModel: ''
+      });
+    }
+
+    return pass1;
   }
 
-  // If OpenAI provider is configured and key is present
   if (provider === 'openai') {
     if (!openaiKey) {
       return buildUnavailableProviderFallback(options, designatedAnswer, evidenceBundle, 'openai', 'missing OPENAI_API_KEY');
     }
-    try {
-      const model = getSetting('openai_model', 'gpt-4o');
-      const res = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${openaiKey}`
-        },
-        body: JSON.stringify({
-          model,
-          response_format: { type: 'json_object' },
-          temperature: 0.1,
-          messages: [
-            { role: 'system', content: SYSTEM_INSTRUCTIONS },
-            { role: 'user', content: userPrompt }
-          ]
-        })
-      });
 
-      if (res.ok) {
-        const data = await res.json();
-        const content = data.choices?.[0]?.message?.content;
-        if (content) {
-          return JSON.parse(content) as AIAuditResponse;
-        }
-      }
-      lastExternalError = `OpenAI HTTP ${res.status}`;
-    } catch (err: any) {
-      lastExternalError = err?.message || 'OpenAI request error';
-      console.warn('OpenAI API call failed:', err);
+    const openaiModel = getSetting('openai_model', 'gpt-4o');
+    const { parsed: pass1, error } = await callOpenAiChatJson(
+      SYSTEM_INSTRUCTIONS,
+      userPrompt,
+      openaiKey,
+      openaiModel,
+      30000,
+      0.1
+    );
+
+    if (!pass1) {
+      return buildUnavailableProviderFallback(options, designatedAnswer, evidenceBundle, 'openai', error);
     }
-    return buildUnavailableProviderFallback(options, designatedAnswer, evidenceBundle, 'openai', lastExternalError);
+
+    if (shouldRunPeerReviewChallenge(pass1, designatedAnswer, isInverted)) {
+      return await verifyFlaggedAuditFinding({
+        stem,
+        optionsBlock,
+        designatedAnswer,
+        isInverted,
+        evidenceText,
+        pass1,
+        provider: 'openai',
+        openaiKey,
+        geminiModels: [],
+        openaiModel
+      });
+    }
+
+    return pass1;
   }
 
   if (provider !== 'built_in') {

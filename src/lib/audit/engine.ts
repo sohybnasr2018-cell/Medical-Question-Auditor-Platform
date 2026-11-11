@@ -3,6 +3,7 @@ import { classifyQuestionSubject } from './classifier';
 import { retrieveQuestionEvidence } from '@/lib/search/semantic';
 import { auditQuestionWithAI } from '@/lib/ai/provider';
 import { AIAuditResponse } from '@/lib/ai/schemas';
+import { isInvertedPolarityQuestion } from './question-polarity';
 import crypto from 'node:crypto';
 
 export interface AuditProgressUpdate {
@@ -26,9 +27,15 @@ const VALID_SEVERITIES = new Set(['critical', 'major', 'moderate', 'minor', 'non
 const VALID_TARGET_TYPES = new Set(['stem', 'answer_key', 'option', 'conflict']);
 
 /**
- * Normalize external LLM response so missing or non-string fields cannot violate SQLite NOT NULL constraints
+ * Normalize external LLM response so missing/inconsistent fields or inverted-polarity
+ * boolean flips cannot corrupt SQLite records or report false errors.
  */
-function sanitizeAiResponse(raw: AIAuditResponse, designatedAnswer: string): AIAuditResponse {
+export function sanitizeAiResponse(
+  raw: AIAuditResponse,
+  designatedAnswer: string,
+  stem: string = '',
+  hasMcqOptions: boolean = true
+): AIAuditResponse {
   const category = VALID_CATEGORIES.has(raw?.findings_category)
     ? raw.findings_category
     : 'potential_error';
@@ -44,9 +51,9 @@ function sanitizeAiResponse(raw: AIAuditResponse, designatedAnswer: string): AIA
 
   const stemEval = raw?.stem_evaluation || ({} as any);
   const ansEval = raw?.answer_key_evaluation || ({} as any);
-  const optionAnalyses: AIAuditResponse['option_analyses'] = Array.isArray(raw?.option_analyses)
+  let optionAnalyses: AIAuditResponse['option_analyses'] = Array.isArray(raw?.option_analyses)
     ? raw.option_analyses.map((o: any) => ({
-        option_letter: String(o?.option_letter || '').toUpperCase().slice(0, 2) || 'A',
+        option_letter: String(o?.option_letter || '').trim().replace(/^option\s+/i, '').toUpperCase().slice(0, 2) || 'A',
         is_correct: Boolean(o?.is_correct),
         is_partially_correct: Boolean(o?.is_partially_correct),
         explanation: String(o?.explanation || 'Evaluated against reference excerpts.'),
@@ -58,16 +65,71 @@ function sanitizeAiResponse(raw: AIAuditResponse, designatedAnswer: string): AIA
     : [];
 
   let proposedAnswers: string[] = Array.isArray(ansEval.proposed_correct_answers)
-    ? ansEval.proposed_correct_answers.map((x: any) => String(x || '').trim()).filter(Boolean)
+    ? ansEval.proposed_correct_answers
+        .map((x: any) => {
+          const s = String(x || '').trim();
+          return hasMcqOptions ? s.replace(/^option\s+/i, '').toUpperCase() : s;
+        })
+        .filter(Boolean)
     : [];
 
-  // General cross-check between option_analyses and proposed_correct_answers to eliminate contradictions
   let finalCategory = category;
   let finalSeverity = severity;
   let hasMulti = Boolean(ansEval.has_multiple_correct_answers);
-  const hasNoCorrect = Boolean(ansEval.has_no_correct_answer);
+  let hasNoCorrect = Boolean(ansEval.has_no_correct_answer);
   let isOrigCorrect = Boolean(ansEval.is_original_key_correct);
+  const desNorm = (designatedAnswer || '').trim().replace(/^option\s+/i, '').toUpperCase();
+  const hasValidDesignatedKey = Boolean(desNorm && !/^(?:NOT\s+PROVIDED|NONE|N\/A)$/i.test(desNorm));
+  const isInverted = isInvertedPolarityQuestion(stem);
 
+  // 1. Inverted-Polarity Guard (EXCEPT / NOT / FALSE / LEAST):
+  // Recover cleanly if LLM set option_analyses.is_correct=true on true statements and false on the winning exception.
+  if (isInverted && optionAnalyses.length >= 2 && finalCategory !== 'insufficient_evidence') {
+    const trueOpts = optionAnalyses.filter(o => o.is_correct);
+    const falseOpts = optionAnalyses.filter(o => !o.is_correct);
+    const rationaleStr = String(ansEval.rationale || raw?.detailed_scientific_explanation || '');
+
+    const explicitComplementMatch =
+      proposedAnswers.length === 1 &&
+      falseOpts.some(f => f.option_letter === proposedAnswers[0].toUpperCase()) &&
+      trueOpts.length >= 2;
+
+    const singleExceptionObj = falseOpts.length === 1 ? falseOpts[0] : undefined;
+    const implicitTruthfulnessFlip =
+      Boolean(singleExceptionObj) &&
+      trueOpts.length === optionAnalyses.length - 1 &&
+      (
+        (ansEval.is_original_key_correct && hasValidDesignatedKey && desNorm === singleExceptionObj!.option_letter) ||
+        /\b(?:false|incorrect|wrong|exception|does\s+not|is\s+not|not\s+true|not\s+belong|correct\s+(?:choice|answer|option)\s+for\s+(?:an?\s+)?['"]?(?:except|not))\b/i.test(singleExceptionObj!.explanation) ||
+        new RegExp(`\\b(?:option\\s+)?${singleExceptionObj!.option_letter}\\b.{0,80}\\b(?:is\\s+false|false\\s+statement|correct\\s+(?:choice|answer)|exception)\\b`, 'i').test(rationaleStr)
+      );
+
+    if (explicitComplementMatch || implicitTruthfulnessFlip) {
+      optionAnalyses = optionAnalyses.map(o => ({ ...o, is_correct: !o.is_correct }));
+      proposedAnswers = explicitComplementMatch
+        ? [proposedAnswers[0].toUpperCase()]
+        : [singleExceptionObj!.option_letter];
+      hasMulti = false;
+      hasNoCorrect = false;
+    }
+  }
+
+  // 2. Empty-citation "has_no_correct_answer" -> downgrade to "insufficient_evidence"
+  const citationsList = Array.isArray(raw?.citations) ? raw.citations : [];
+  const hasRealOptionCitation = optionAnalyses.some(
+    o => o.citation_quote.trim().length > 12 && !/^(?:none|not provided|unavailable)$/i.test(o.citation_book.trim()) && !/not provided/i.test(o.citation_quote)
+  );
+  const hasRealTopCitation = citationsList.some(
+    (c: any) => String(c?.quote || '').trim().length > 12 && !/^(?:none|not provided|unavailable)$/i.test(String(c?.reference_name || '').trim())
+  );
+  if (hasNoCorrect && proposedAnswers.length === 0 && !hasRealOptionCitation && !hasRealTopCitation) {
+    finalCategory = 'insufficient_evidence';
+    finalSeverity = 'none';
+    hasNoCorrect = false;
+    isOrigCorrect = true;
+  }
+
+  // 3. Cross-check option_analyses vs proposed_correct_answers to eliminate contradictions
   if (optionAnalyses.length > 0 && finalCategory !== 'insufficient_evidence') {
     const validOptionSet = new Set(optionAnalyses.filter(o => o.is_correct).map(o => o.option_letter.toUpperCase()));
     if (validOptionSet.size > 0 && proposedAnswers.length > 0) {
@@ -82,15 +144,30 @@ function sanitizeAiResponse(raw: AIAuditResponse, designatedAnswer: string): AIA
     }
 
     hasMulti = proposedAnswers.length > 1;
-    const desNorm = (designatedAnswer || '').trim().toUpperCase();
     const stemDefect = Boolean(stemEval.has_scientific_error) || Boolean(stemEval.has_linguistic_ambiguity);
 
-    if (desNorm && proposedAnswers.length === 1 && proposedAnswers[0].toUpperCase() === desNorm && !hasMulti && !hasNoCorrect && !stemDefect) {
+    if (
+      hasValidDesignatedKey &&
+      proposedAnswers.length === 1 &&
+      proposedAnswers[0].toUpperCase() === desNorm &&
+      !hasMulti &&
+      !hasNoCorrect &&
+      !stemDefect
+    ) {
       isOrigCorrect = true;
-      if (finalCategory === 'confirmed_error' && !ansEval.has_no_correct_answer) {
+      if (finalCategory === 'confirmed_error' || finalCategory === 'highly_probable_error' || finalCategory === 'potential_error') {
         finalCategory = 'no_detected_issue';
         finalSeverity = 'none';
       }
+    } else if (
+      hasValidDesignatedKey &&
+      /^[A-E]$/.test(desNorm) &&
+      !isOrigCorrect &&
+      finalCategory === 'confirmed_error' &&
+      confidence < 85
+    ) {
+      finalCategory = 'potential_error';
+      finalSeverity = 'moderate';
     }
   }
 
@@ -112,17 +189,15 @@ function sanitizeAiResponse(raw: AIAuditResponse, designatedAnswer: string): AIA
       rationale: String(ansEval.rationale || raw?.detailed_scientific_explanation || 'Evaluated using reference excerpts.')
     },
     option_analyses: optionAnalyses,
-    citations: Array.isArray(raw?.citations)
-      ? raw.citations.map((c: any) => ({
-          reference_name: String(c?.reference_name || 'Uploaded Reference'),
-          pdf_page_index: Number.isFinite(Number(c?.pdf_page_index)) ? Number(c.pdf_page_index) : 0,
-          printed_page_number: String(c?.printed_page_number ?? 'N/A'),
-          quote: String(c?.quote || ''),
-          explanation: String(c?.explanation || ''),
-          target_type: VALID_TARGET_TYPES.has(c?.target_type) ? c.target_type : 'option',
-          target_identifier: String(c?.target_identifier || 'General')
-        }))
-      : [],
+    citations: citationsList.map((c: any) => ({
+      reference_name: String(c?.reference_name || 'Uploaded Reference'),
+      pdf_page_index: Number.isFinite(Number(c?.pdf_page_index)) ? Number(c?.pdf_page_index) : 0,
+      printed_page_number: String(c?.printed_page_number ?? 'N/A'),
+      quote: String(c?.quote || ''),
+      explanation: String(c?.explanation || ''),
+      target_type: VALID_TARGET_TYPES.has(c?.target_type) ? c.target_type : 'option',
+      target_identifier: String(c?.target_identifier || 'General')
+    })),
     findings_category: finalCategory,
     error_severity: finalSeverity,
     confidence_score: confidence,
@@ -269,7 +344,7 @@ export async function executeAuditSession(
           classification.matchedReferenceBookIds
         );
         const rawAiResult = await auditQuestionWithAI(q.stem, options, q.designated_answer, evidenceBundle, providerMode);
-        const aiResult = sanitizeAiResponse(rawAiResult, q.designated_answer || '');
+        const aiResult = sanitizeAiResponse(rawAiResult, q.designated_answer || '', q.stem, options.length > 0);
 
         return { q, options, classification, aiResult };
       })
